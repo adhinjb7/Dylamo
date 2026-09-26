@@ -1,0 +1,10 @@
+node_modules/
+.npm-cache/
+.env
+.env.*
+!.env.example
+coverage/
+dist/
+data/
+work/
+Hack_Atlantic_Agent_Telephony_Codex_Brief_Revised.docx

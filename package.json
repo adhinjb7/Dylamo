@@ -1,0 +1,17 @@
+{
+  "name": "hack-atlantic-agent-telephony",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:voice": "npm run build:protocol && npm run dev --workspace @hack-atlantic/voice-webhook",
+    "dev:daemon": "npm run dev --workspace @hack-atlantic/daemon",
+    "test": "npm run test --workspace @hack-atlantic/protocol && npm run test --workspace @hack-atlantic/voice-webhook && npm run test --workspace @hack-atlantic/daemon",
+    "build:protocol": "npm run build --workspace @hack-atlantic/protocol",
+    "test:protocol": "npm run test --workspace @hack-atlantic/protocol",
+    "test:daemon": "npm run test --workspace @hack-atlantic/daemon",
+    "test:all": "npm test"
+  }
+}

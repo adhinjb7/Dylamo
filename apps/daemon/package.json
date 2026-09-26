@@ -1,0 +1,17 @@
+{
+  "name": "@hack-atlantic/daemon",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/server.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@hack-atlantic/protocol": "file:../../packages/protocol",
+    "ws": "^8.21.3"
+  }
+}
