@@ -31,6 +31,13 @@ test('Codex run identity requires both thread and turn IDs', () => {
   assert.equal(DaemonEvent.safeParse({ ...started, codexTurnId: '' }).success, false);
 });
 
+test('task start may carry a validated Codex continuation thread ID', () => {
+  const start = { ...common, ...run, type: 'task.start', agentId: machineId, prompt: 'Follow up' };
+  assert.equal(ServerEvent.safeParse(start).success, true);
+  assert.equal(ServerEvent.safeParse({ ...start, codexThreadId: 'thread-1' }).success, true);
+  assert.equal(ServerEvent.safeParse({ ...start, codexThreadId: '' }).success, false);
+});
+
 test('approval requests and responses bind to the exact action digest', () => {
   const request = {
     ...common, ...run, type: 'approval.required', approvalId, actionDigest,

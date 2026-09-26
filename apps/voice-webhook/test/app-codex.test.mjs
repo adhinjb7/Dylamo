@@ -28,6 +28,7 @@ test('Codex phone mode routes to the real-agent slot and persists thread/turn ID
   const streamSid = `MZ${'b'.repeat(32)}`;
   const store = openStateStore(':memory:');
   const spoken = [];
+  const dispatched = [];
   let bridge;
   const server = createServer({
     authToken, accountSid, publicBaseUrl, allowedCallerNumber: caller,
@@ -50,8 +51,9 @@ test('Codex phone mode routes to the real-agent slot and persists thread/turn ID
     agents: [{ agentId: CODEX_AGENT_ID, adapterType: 'codex', name: 'Codex read-only agent', status: 'idle' }],
     onEvent: (event) => {
       if (event.type !== 'task.start') return;
+      dispatched.push(event);
       const base = { v: 1, machineId, sessionId: event.sessionId, taskId: event.taskId, runId: event.runId };
-      client.send({ ...base, eventId: randomUUID(), type: 'agent.started', codexThreadId: 'thread-test', codexTurnId: 'turn-test' });
+      client.send({ ...base, eventId: randomUUID(), type: 'agent.started', codexThreadId: 'thread-test', codexTurnId: `turn-test-${dispatched.length}` });
       client.send({ ...base, eventId: randomUUID(), type: 'agent.message', text: 'I inspected the test repository.' });
       client.send({ ...base, eventId: randomUUID(), type: 'task.completed', summary: 'Repository inspected without changes.' });
     },
@@ -87,8 +89,19 @@ test('Codex phone mode routes to the real-agent slot and persists thread/turn ID
     assert.ok(spoken.some((message) => message.includes('real Codex task')));
     assert.ok(spoken.some((message) => message.includes('inspected the test repository')));
     assert.equal(run.codex_thread_id, 'thread-test');
-    assert.equal(run.codex_turn_id, 'turn-test');
+    assert.equal(run.codex_turn_id, 'turn-test-1');
     assert.ok(store.listAudit(sessionId).some((event) => event.type === 'agent.started'));
+    assert.equal(dispatched[0].codexThreadId, undefined);
+    await waitFor(() => spoken.some((message) => message.includes('follow-up question')));
+    bridge.onTranscript('What did you find in those packages?');
+    await waitFor(() => store.listTasksForSession(sessionId).length === 2);
+    const followUp = store.listTasksForSession(sessionId)[1];
+    await waitFor(() => store.getTask(followUp.id).state === 'completed');
+    assert.equal(followUp.prompt, 'What did you find in those packages?');
+    assert.equal(dispatched[1].codexThreadId, 'thread-test');
+    assert.equal(dispatched[1].machineId, dispatched[0].machineId);
+    assert.equal(dispatched[1].agentId, dispatched[0].agentId);
+    assert.equal(store.getRunForTask(followUp.id).codex_turn_id, 'turn-test-2');
   } finally {
     if (media && media.readyState === WebSocket.OPEN) {
       media.close();

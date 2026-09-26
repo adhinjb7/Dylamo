@@ -93,15 +93,18 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
         run.diagnostic = rpcErrorCode(message.error);
         return finish(run, 'task.failed', { reason: 'Codex could not load workspace requirements. The repository investigation did not start.' });
       }
-      run.stage = 'thread/start';
-      run.threadRequestId = request(run, 'thread/start', sessionOptions);
+      run.stage = run.resumeThreadId ? 'thread/resume' : 'thread/start';
+      const { serviceName, ...resumeOptions } = sessionOptions;
+      run.threadRequestId = request(run, run.stage, run.resumeThreadId
+        ? { ...resumeOptions, threadId: run.resumeThreadId } : sessionOptions);
       return;
     }
     if (message.id === run.threadRequestId) {
       const threadId = message.result?.thread?.id;
-      if (typeof threadId !== 'string') {
+      if (typeof threadId !== 'string' || (run.resumeThreadId && threadId !== run.resumeThreadId)) {
         run.diagnostic = rpcErrorCode(message.error);
-        return finish(run, 'task.failed', { reason: 'Codex could not start a thread.' });
+        return finish(run, 'task.failed', { reason: run.resumeThreadId
+          ? 'Codex could not resume the previous conversation.' : 'Codex could not start a thread.' });
       }
       if (!hasExpectedCodexPermissions(message.result, sessionOptions)) {
         return finish(run, 'task.failed', { reason: 'Codex did not confirm the required read-only permissions profile.' });
@@ -160,7 +163,7 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
     }
     if (event.type !== 'task.start' || event.agentId !== CODEX_AGENT_ID || runs.has(event.runId)) return false;
     const run = { sessionId: event.sessionId, taskId: event.taskId, runId: event.runId,
-      prompt: event.prompt, process: null, nextId: 0, finished: false,
+      prompt: event.prompt, resumeThreadId: event.codexThreadId ?? null, process: null, nextId: 0, finished: false,
       initializeId: null, threadRequestId: null, turnRequestId: null,
       accountRequestId: null, requirementsRequestId: null, lastFailure: null,
       threadId: null, turnId: null, answer: '', deniedRequest: false, timer: null,

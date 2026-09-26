@@ -41,7 +41,7 @@ export const DaemonEvent = z.discriminatedUnion('type', [
 // request before unblocking a protected action.
 export const ServerEvent = z.discriminatedUnion('type', [
   z.strictObject({ ...common, type: z.literal('machine.registered'), heartbeatIntervalMs: z.number().int().min(1000).max(60000) }),
-  z.strictObject({ ...common, ...run, type: z.literal('task.start'), agentId: InternalId, prompt: z.string().min(1).max(10000), scenario: z.enum(['basic', 'approval']).optional() }),
+  z.strictObject({ ...common, ...run, type: z.literal('task.start'), agentId: InternalId, prompt: z.string().min(1).max(10000), codexThreadId: z.string().min(1).max(200).optional(), scenario: z.enum(['basic', 'approval']).optional() }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.message'), text: z.string().min(1).max(4000) }),
   z.strictObject({ ...common, ...run, type: z.literal('task.cancel') }),
   z.strictObject({ ...common, ...run, type: z.literal('approval.response'), approvalId: InternalId, actionDigest: z.string().regex(/^[a-f0-9]{64}$/), approved: z.boolean() }),

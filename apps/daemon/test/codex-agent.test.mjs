@@ -33,7 +33,7 @@ function fixture(allowFullRead = false) {
   return { agent, sent, requests, errors, child, start, reply, tick, allowFullRead };
 }
 
-async function startThread(f) {
+async function startThread(f, method = 'thread/start') {
   assert.equal(f.agent.receive(f.start), true);
   assert.equal(f.requests[0].method, 'initialize');
   assert.equal(f.requests[0].params.capabilities.experimentalApi, true);
@@ -47,7 +47,7 @@ async function startThread(f) {
   assert.equal(f.requests[3].method, 'configRequirements/read');
   f.reply({ id: f.requests[3].id, result: { requirements: null } });
   await f.tick();
-  assert.equal(f.requests[4].method, 'thread/start');
+  assert.equal(f.requests[4].method, method);
   const threadParams = f.requests[4].params;
   assert.equal(threadParams.approvalPolicy, 'on-request');
   assert.equal(threadParams.sandbox, undefined, 'sandbox must not override the named permissions profile');
@@ -88,6 +88,48 @@ test('Codex app-server read-only run persists IDs and completes with final answe
     assert.equal(f.sent[1].codexThreadId, 'thread-test');
     assert.equal(f.sent[1].codexTurnId, 'turn-test');
     assert.equal(f.sent[3].summary, 'The project has three workspaces.');
+  } finally { f.agent.stop(); }
+});
+
+test('Codex resumes the prior thread for a follow-up and starts a new read-only turn', async () => {
+  const f = fixture(true);
+  f.start.codexThreadId = 'thread-test';
+  try {
+    const threadParams = await startThread(f, 'thread/resume');
+    assert.equal(threadParams.threadId, 'thread-test');
+    assert.equal(threadParams.permissions, ':read-only');
+    assert.equal(threadParams.serviceName, undefined);
+    f.reply({ id: f.requests[4].id, result: { thread: { id: 'thread-test' },
+      sandbox: { type: 'readOnly', networkAccess: false }, approvalPolicy: 'on-request',
+      activePermissionProfile: { id: ':read-only', extends: null } } });
+    await f.tick();
+    assert.equal(f.requests[5].method, 'turn/start');
+    assert.equal(f.requests[5].params.threadId, 'thread-test');
+    assert.equal(f.requests[5].params.permissions, ':read-only');
+    assert.deepEqual(f.requests[5].params.input, [{ type: 'text', text: f.start.prompt }]);
+    f.reply({ id: f.requests[5].id, result: { turn: { id: 'turn-follow-up' } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).codexThreadId, 'thread-test');
+    assert.equal(f.sent.at(-1).codexTurnId, 'turn-follow-up');
+    f.reply({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-follow-up',
+      item: { type: 'agentMessage', phase: 'final_answer', text: 'Here is the follow-up answer.' } } });
+    f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-follow-up', status: 'completed' } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.completed');
+  } finally { f.agent.stop(); }
+});
+
+test('Codex refuses a resume response for the wrong thread', async () => {
+  const f = fixture(true);
+  f.start.codexThreadId = 'thread-test';
+  try {
+    await startThread(f, 'thread/resume');
+    f.reply({ id: f.requests[4].id, result: { thread: { id: 'other-thread' },
+      sandbox: { type: 'readOnly', networkAccess: false }, approvalPolicy: 'on-request',
+      activePermissionProfile: { id: ':read-only', extends: null } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.failed');
+    assert.equal(f.requests.some((request) => request.method === 'turn/start'), false);
   } finally { f.agent.stop(); }
 });
 

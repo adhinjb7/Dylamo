@@ -157,6 +157,14 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
       if (call?.realtime) call.realtime.speak('The simulated task needs approval. Hang up and I will call you back to confirm it.');
       else void initiateApprovalCallback(event.approvalId);
     }
+    if (call && agentMode === 'codex' && (event.type === 'task.completed' || event.type === 'task.failed')) {
+      if (event.type === 'task.completed') {
+        call.codexThreadId = stateStore.getRun(event.runId)?.codex_thread_id ?? null;
+        call.realtime?.speak('You can ask a follow-up question now.');
+      }
+      call.taskId = null;
+      call.busyNotified = false;
+    }
   }
 
   async function initiateApprovalCallback(approvalId) {
@@ -211,12 +219,22 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
   });
 
   function startAgentTask(call, transcript) {
-    if (agentMode === 'voice' || call.taskId || !call.authenticated || typeof transcript !== 'string') return;
+    if (agentMode === 'voice' || !call.authenticated || typeof transcript !== 'string') return;
     const prompt = transcript.trim().slice(0, 10_000);
     if (!prompt) return;
+    if (call.taskId) {
+      if (agentMode === 'codex' && !call.busyNotified) {
+        call.busyNotified = true;
+        call.realtime?.speak('I am still working on that request. Please ask again after I answer.');
+      }
+      return;
+    }
+    const session = stateStore.getSession(call.sessionId);
     const selected = [...agentsByMachine].flatMap(([machineId, agents]) =>
       agents.filter((agent) => agent.adapterType === agentMode && agent.status !== 'offline')
-        .map((agent) => ({ machineId, agentId: agent.agentId }))).find(({ machineId }) => daemonGateway.status(machineId).online);
+        .map((agent) => ({ machineId, agentId: agent.agentId }))).find(({ machineId, agentId }) =>
+      daemonGateway.status(machineId).online && (!session.machine_id ||
+        (session.machine_id === machineId && session.agent_id === agentId)));
     if (!selected) {
       call.realtime?.speak('The selected agent is offline. Please try again shortly.');
       return;
@@ -225,20 +243,24 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     const taskId = stateStore.createTask({ sessionId: call.sessionId, prompt });
     const runId = stateStore.createRun({ taskId, agentId: selected.agentId });
     call.taskId = taskId;
+    call.busyNotified = false;
     const delivered = daemonGateway.sendToMachine(selected.machineId, {
       v: PROTOCOL_VERSION, eventId: randomUUID(), machineId: selected.machineId,
       sessionId: call.sessionId, taskId, runId, type: 'task.start',
-      agentId: selected.agentId, prompt, scenario: agentMode === 'fake' && callbackCallerNumber ? 'approval' : 'basic',
+      agentId: selected.agentId, prompt,
+      ...(agentMode === 'codex' && call.codexThreadId ? { codexThreadId: call.codexThreadId } : {}),
+      scenario: agentMode === 'fake' && callbackCallerNumber ? 'approval' : 'basic',
     });
     if (!delivered) {
       stateStore.transitionRun(runId, 'failed');
       stateStore.transitionTask(taskId, 'failed');
+      call.taskId = null;
       call.realtime?.speak('The agent disconnected before the task started.');
       return;
     }
     stateStore.audit(call.sessionId, 'task.dispatched', { taskId, runId });
     call.realtime?.speak(agentMode === 'codex'
-      ? 'I started a real Codex task in read-only mode. You can hang up; it will keep running.'
+      ? 'I started a real Codex task in read-only mode. Stay on the line for the answer and follow-ups, or hang up while it runs.'
       : 'I started a simulated task. No files will be changed. You can hang up; it will keep running.');
   }
 
