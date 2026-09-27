@@ -148,7 +148,7 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
               model: 'gpt-transcribe',
               languages: ['en'],
               prompt: 'An English-language phone call with Dylamo, a voice interface for Codex repository tasks.',
-              keywords: ['Dylamo', 'Codex', 'Git', 'README', 'demo repository', 'Run the demo push'],
+              keywords: ['Dylamo', 'Codex', 'Git', 'README', 'demo repository', 'Run the demo push', 'Push the demo repo'],
             } } : {}),
             turn_detection: controlled
               ? { type: 'semantic_vad', create_response: false, interrupt_response: false }

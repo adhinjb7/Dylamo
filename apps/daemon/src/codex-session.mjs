@@ -39,6 +39,13 @@ export function codexProcessEnvironment({ source = process.env, cwd, allowWorksp
       'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT',
     ].includes(name.toUpperCase())) delete env[name];
   }
+  if (isolateDemoGit) {
+    // These two values are safe, invariant parts of the local fixture. Pin
+    // them here rather than requiring an operator to reproduce them in a
+    // private .env file; GIT_CONFIG_GLOBAL remains the fixture-specific path.
+    env.GIT_CONFIG_NOSYSTEM = '1';
+    env.GIT_TERMINAL_PROMPT = '0';
+  }
   if (allowWorkspaceWrite === true) {
     const scratch = prepareCodexWorkspaceTemp(cwd);
     env.TMP = scratch; env.TEMP = scratch; env.TMPDIR = scratch;

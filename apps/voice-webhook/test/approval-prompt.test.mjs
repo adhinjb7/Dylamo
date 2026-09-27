@@ -17,6 +17,14 @@ test('verified demo approval speaks implications without command or path', () =>
   }
 });
 
+test('callback prompts offer fixed speech choices while keeping keypad as a fallback', () => {
+  const text = approvalPrompt(context, { channel: 'callback' });
+  assert.match(text, /Say approve or push the demo repo to allow once/i);
+  assert.match(text, /reject to decline/i);
+  assert.match(text, /details for the exact command/i);
+  assert.match(text, /Keypad 1, 2, and 3 also work/i);
+});
+
 test('exact command, path and decision choices remain available on request', () => {
   for (const channel of ['inbound', 'callback']) {
     const text = approvalPrompt(context, { channel, details: true });

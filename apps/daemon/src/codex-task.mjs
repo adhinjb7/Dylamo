@@ -3,6 +3,8 @@
 export const DEMO_PUSH_COMMAND = 'git push origin HEAD:refs/heads/phone-demo';
 const DEMO_PUSH_PHRASES = new Set([
   'run the demo push', 'please run the demo push', 'run the demo push please',
+  'push the demo repo', 'please push the demo repo', 'push the demo repo please',
+  'push the demo repository', 'please push the demo repository', 'push the demo repository please',
 ]);
 
 export function prepareCodexTask(prompt, approvalCommand) {

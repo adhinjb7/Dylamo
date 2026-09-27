@@ -16,7 +16,7 @@ export function approvalPrompt(context, { mode = 'codex', channel = 'inbound', d
       : 'Ready to publish the prepared changes to the local demo branch. Nothing goes to GitHub.';
   }
   const choices = channel === 'callback'
-    ? 'Press 1 to approve once, 2 to reject, or 3 for details.'
+    ? 'Say approve or push the demo repo to allow once, reject to decline, or details for the exact command. Keypad 1, 2, and 3 also work.'
     : details ? 'Say approve or press 1 to allow once. Say reject or press 2 to decline.'
       : 'Say approve or reject, or details for the exact command. You can hang up for a callback.';
   return `${description} ${choices}`;

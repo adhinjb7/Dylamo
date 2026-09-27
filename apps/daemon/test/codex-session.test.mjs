@@ -87,8 +87,8 @@ test('coding mode moves process scratch into its workspace and strips service se
 });
 
 test('named local demo push removes ambient Git injection before starting Codex', () => {
-  const source = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'fixture-config',
-    GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'remote.origin.pushurl',
+  const source = { GIT_CONFIG_NOSYSTEM: '0', GIT_CONFIG_GLOBAL: 'fixture-config',
+    GIT_TERMINAL_PROMPT: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'remote.origin.pushurl',
     GIT_CONFIG_VALUE_0: 'unexpected-target', GIT_PAGER: 'unexpected-pager' };
   const env = codexProcessEnvironment({ source, cwd: process.cwd(), isolateDemoGit: true });
   assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');

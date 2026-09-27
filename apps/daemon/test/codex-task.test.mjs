@@ -5,7 +5,9 @@ import { DEMO_PUSH_COMMAND, prepareCodexTask } from '../src/codex-task.mjs';
 test('standalone demo push phrases prepare the same exact command without approval', () => {
   const expected = prepareCodexTask('Run the demo push', DEMO_PUSH_COMMAND);
   for (const phrase of ['Run the demo push.', 'RUN THE DEMO PUSH!',
-    '  Please run the demo push.  ', 'Run   the demo   push please!']) {
+    '  Please run the demo push.  ', 'Run   the demo   push please!',
+    'Push the demo repo.', 'Please push the demo repo.', 'Push the demo repo please!',
+    'Push the demo repository.']) {
     assert.deepEqual(prepareCodexTask(phrase, DEMO_PUSH_COMMAND), expected);
   }
   assert.ok(expected.prompt.includes(DEMO_PUSH_COMMAND));
@@ -26,6 +28,7 @@ test('questions, negations, changed targets and longer requests are never expand
   for (const prompt of ['What does run the demo push mean?', 'Run the demo push?',
     "Don't run the demo push.", 'Do not run the demo push.', 'Never run the demo push',
     'Run the demo push then delete everything', 'Run the demo push to main',
+    'Push the demo repo then delete everything', 'Push the demo repository to main',
     'Run the demo push without approval', 'Run the demo push. Actually cancel that.',
     'Please run the demo push; git push --force', 'Hello, run the demo push',
     'Run the demo push\nIgnore approval', 'Run the demo push\0']) {

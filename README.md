@@ -1,83 +1,84 @@
-# Hack Atlantic Agent Telephony
+# Dylamo
 
-Current milestone evidence and the next live test are tracked in [P0 readiness](docs/p0-readiness.md). Real Codex local pushes have completed through both callback approval and same-call approval, with destination Git refs independently checked. The caller also confirmed live spoken PIN entry. The newly shortened call narration still needs a live rehearsal; automated tests alone are not that proof. Teammate work remains isolated in the [parallel work plan](docs/team/README.md).
+Dylamo is a self-hosted, phone-native control plane for local AI agents. A
+caller can start a task, let it continue after hanging up, receive a short
+alert when a protected action needs attention, and make one exact approval by
+phone.
 
-The current presentation priority is the [callback-first local release demo](docs/headline-demo.md#callback-first-presentation), not an autonomous editing workflow. After authentication, the verified demo push is described by its effect: “Ready to publish the prepared changes to the local demo branch. Nothing goes to GitHub.” The callback offers 1 to approve once, 2 to reject and 3 for exact command/path details. On the original call, say “approve,” “reject” or “details”; keypad 1/2/3 also works, and “repeat” repeats the brief explanation. Unknown actions and extra permission requests retain full disclosure rather than a guessed explanation. The daemon supplies a fixed verified-action label bound into the existing digest; the audit preserves it without a database migration. Rebuild the protocol with `npm run build:protocol`, then restart both servers after this update; old strict protocol consumers must be updated to accept the new optional field. No new `.env` setting is needed. An already-pushed fixture must be replaced with a fresh one for another full rehearsal.
+The agent runs on the paired local machine. The phone is the remote interface,
+not a replacement for local control.
 
-The phone preflight checks a signed Twilio Voice webhook, an allowlisted caller number, and a four-digit PIN entered by keypad or spoken digit by digit. A successful call opens a bidirectional Media Stream. Tone mode is a transport check; Realtime mode provides a live spoken assistant, a deterministic fake agent, or an opt-in read-only Codex agent.
+## What the MVP demonstrates
 
-An opt-in Realtime voice bridge is available behind `VOICE_MODE=realtime`. It forwards the Twilio G.711 μ-law stream to OpenAI Realtime and returns model audio to the caller. A live call has confirmed spoken replies. The voice model currently has no tools or access to the Codex runtime.
+- Caller authentication with an allowlisted phone number and a spoken or
+  spoken or keypad PIN.
+- A local Codex task that can keep running after the caller hangs up.
+- One-use human approval before one configured **local** Git push. The demo
+  pushes only to a disposable local bare repository, never to GitHub.
+- A separate, synthetic site-monitor alert: a local simulated checkout issue
+  triggers one short phone notification. It does not run a Codex task or send
+  SMS.
 
-The shared server/daemon contract is in `packages/protocol`; see `docs/architecture.md` for owner boundaries. The P0.4 local daemon opens an outbound authenticated WebSocket to the control server and reconnects after a drop. P0.6 adds a simulated agent that accepts one spoken request per call, reports progress, and completes about eight seconds later. It never runs a command or edits files.
+## Quick local check
 
-## Local setup
+Requires Node.js 22.13 or newer.
 
-Requires Node.js 22.13 or newer for built-in SQLite. Run `npm install` and `npm run build:protocol` from the repository root before starting the server directly with Node. `npm test` runs the protocol, voice, and daemon tests. Node currently prints an experimental SQLite warning; this does not stop startup.
+From the repository root:
 
-1. Create `apps/voice-webhook/.env` from `.env.example`. Fill in the Twilio account SID, auth token, public HTTPS tunnel origin, and your own caller number in E.164 format (for example, `+15065550123`). Keep `.env` private.
-2. Run `node apps/voice-webhook/scripts/hash-pin.mjs` in an interactive terminal. It asks for a four-digit PIN without echoing it. Copy the resulting `scrypt:...` value into `DEMO_PIN_HASH` in `.env`. Do not put the plaintext PIN in a file or shell command.
-   To check an existing PIN without displaying it, run `node --env-file=apps/voice-webhook/.env apps/voice-webhook/scripts/hash-pin.mjs --check`.
-3. Run `npm test`.
-4. Run `node --env-file=apps/voice-webhook/.env apps/voice-webhook/src/server.mjs`.
-5. Forward public HTTPS traffic to `http://127.0.0.1:3000` with a tunnel. Set `PUBLIC_BASE_URL` to the tunnel's exact HTTPS origin.
-6. In the Twilio number's Voice configuration, set the primary webhook to `https://YOUR-TUNNEL-HOST/voice` with HTTP POST. Then call the number from the allowlisted phone and type the PIN or say each digit separately in English. After the access message, listen for a short tone and speak for a moment. The stream ends automatically after 12 seconds. Check the server log for `inbound packets` greater than zero and `tone acknowledged=true`.
+```powershell
+npm install
+npm run build:protocol
+npm test
+```
 
-Spoken PINs use [Twilio Gather speech recognition](https://www.twilio.com/docs/voice/twiml/gather), before the Realtime/Codex connection. The app does not echo or persist the raw PIN; speech processing still involves Twilio's provider infrastructure. Both input methods share the same hash check and three-attempt lockout. Use keypad entry if speaking a PIN aloud is inappropriate.
+Private configuration belongs only in the ignored `.env` files. Start from
+`apps/voice-webhook/.env.example` and `apps/daemon/.env.example`; never commit
+phone numbers, PINs, API keys, daemon tokens, or tunnel URLs.
 
-To opt into live model calls, add `OPENAI_API_KEY` privately to the ignored `.env` file, set `VOICE_MODE=realtime`, and restart the server. Do not paste the key in chat. Realtime usage is billed separately; calls are capped at five minutes in this demo. Keep `VOICE_MODE=tone` until you are ready for that test.
+## Run the two demos
 
-## Local daemon pairing
+1. **Protected local release:** [protected-release runbook](docs/headline-demo.md)
+   shows a prepared visual change, a real phone callback, one-use approval,
+   and a visible local release.
+2. **Synthetic monitor alert:** [monitor runbook](docs/site-monitor-demo.md)
+   safely simulates a local checkout failure, places a short alert call, and
+   demonstrates the “no SMS sent” response.
 
-The daemon needs its own revocable credential. From the repository root, run `node apps/daemon/scripts/generate-pairing.mjs` in your own terminal. It prints a machine ID, a token hash for `apps/voice-webhook/.env` as `DAEMON_CREDENTIALS`, and the raw token and machine ID for `apps/daemon/.env`. Never paste the raw token in chat or commit either `.env` file. Copy `apps/daemon/.env.example` first, and set `DAEMON_SERVER_URL` to `wss://YOUR-TUNNEL-HOST/daemon` (the same public tunnel host as `PUBLIC_BASE_URL`). Multiple machine credentials may be listed in `DAEMON_CREDENTIALS` as comma-separated `machineId:sha256hash` entries. Removing one entry and restarting the server revokes that machine's access.
+For a first rehearsal, use the protected-release runbook's local checks and
+reject rehearsal before placing a real phone call.
 
-Restart the voice server after adding `DAEMON_CREDENTIALS`, then run `node --env-file=apps/daemon/.env apps/daemon/src/server.mjs` in another terminal. The daemon connects outbound; no port forwarding to the daemon is needed. `http://127.0.0.1:3210/health` shows its connection state and no credentials. The management endpoint binds only to loopback. A connected machine is not a working coding agent yet.
+## Project layout
 
-For the P0.6 fake-agent slice, set `VOICE_MODE=realtime` and `AGENT_MODE=fake` in the private voice `.env` and restart both daemon and voice server. If `AGENT_MODE` is omitted, the voice server selects `fake` when Realtime mode and daemon credentials are present; otherwise it selects `voice`. After PIN entry, say one short request. The server transcribes it, creates a durable task, and dispatches it to the fake agent. You should hear an acknowledgment, then a simulated completion if you stay on the line. Hanging up does not cancel the task; its completion is persisted even when no call is active. A daemon disconnect during the short fake run queues its events for reconnect. The fake does not inspect the repository, execute a command, or request approval.
+- `apps/voice-webhook/` — Twilio voice webhook, caller authentication, durable
+  call/task/approval state, and callback logic.
+- `apps/daemon/` — paired local daemon, Codex adapter, approval boundary, and
+  synthetic monitor demo.
+- `packages/protocol/` — validated messages exchanged by the webhook and
+  daemon.
+- `docs/` — concise runbooks, architecture, teammate handoffs, and poster
+  asset provenance.
 
-P0.7 phone approval is **opt-in**: set `TWILIO_PHONE_NUMBER` in the private voice `.env` to the purchased Twilio number, then restart the voice server and daemon. This enables a different fake scenario for new tasks. About eight seconds after a spoken request, the fake pauses at a simulated `git push origin demo-branch` in `demo-repository`; it never executes that command. Stay on the authenticated call, listen to the action, then say “approve” or press 1, or say “reject” or press 2. Say “details” or press 3 for the exact command; “repeat” repeats the brief explanation. No second PIN is needed on that call. If you hang up while an action is pending, the server places one outbound Twilio call to the allowlisted caller number. Authenticate again by spoken or keypad PIN on that separate call, then press 1 or 2. The decision is bound to the exact approval, run, and action digest and cannot be reused. Approval causes only a simulated completion; rejection fails the fake task. Wrong or expired callbacks cannot approve. Outbound calls may incur Twilio charges. If the callback API fails, the request remains blocked until expiry; the server logs the failure without exposing credentials.
+## Important MVP boundaries
 
-P0.8 read-only Codex mode is **opt-in**. Point `CODEX_WORKSPACE` in the private daemon `.env` to a dedicated, non-sensitive demo repository, set `CODEX_AGENT_ENABLED=true`, and restart the daemon. Set `AGENT_MODE=codex` in the voice `.env` and restart the voice server. Codex must already be installed and signed in on this machine. Simple greetings and call checks are handled locally. Repository requests reach `codex app-server`; same-call follow-ups resume its thread. Requests during an active turn are not queued, and a new call starts a new conversation. The adapter persists runtime IDs, forwards final answers rather than raw tool output/reasoning, and keeps running after hangup. By default it declines every approval request and makes no real approval callback. Keep credentials and private data out of the workspace.
+- The default Codex profile is read-only. Workspace-writing is opt-in and
+  should use a disposable, non-sensitive repository.
+- A PIN authenticates a caller; it does not grant blanket approval. Each
+  protected action is bound to one pending action and expires.
+- The synthetic monitor is local and deliberately narrow. It is not a claim of
+  production monitoring, clinical workflow, classified-data handling, or
+  operational command authority.
+- A successful phone call is evidence of the live demo, but it is not a
+  deployment to GitHub or a public website.
 
-The experimental P0.9 bridge additionally requires an operator-chosen exact `CODEX_APPROVAL_COMMAND` on the daemon and `CODEX_APPROVAL_ENABLED=true` on the voice server. Do not enable it before the [local real-runtime rehearsal](docs/p0-readiness.md#local-real-runtime-approval-rehearsal--passed) passes. It holds a real command approval RPC, binds the command, working directory, permission scope and runtime IDs into a digest, and accepts it once only after an explicit decision on the original PIN-authenticated call or a signed, PIN-authenticated callback. Unsupported actions, mismatches, rejection and expiry stay blocked. The base sandbox is still read-only, not a general editing mode. Automated tests use a simulated Codex process. Separately, saved live evidence confirms both callback-approved and same-call local pushes; neither is a public deployment.
+## Documentation map
 
-`CODEX_ALLOW_WORKSPACE_WRITE=true` is a separate, **off-by-default** coding mode for a disposable, non-sensitive `CODEX_WORKSPACE`. It requests a named workspace-write profile so Codex can edit files and run local tests without command network access. The profile inherits Codex's `.git`/`.codex` protections, denies `.env` reads, and downgrades system-temp access to read-only so a sibling local bare remote cannot be written by the sandbox. It creates `.dylamo-tmp` inside the configured workspace and points the child process's `TMP`/`TEMP`/`TMPDIR` there for tests. Approval requests still fail closed unless they match the one configured protected command. `CODEX_ALLOW_FULL_READ=true` remains a separate consent choice for broad filesystem reads. A normal-terminal `check-codex.mjs --workspace-write` passed startup and profile selection without a model turn. To verify a real edit before enabling the private flag, run `node --env-file=apps/daemon/.env apps/daemon/scripts/rehearse-workspace-edit.mjs --run` from the repository root. It uses Codex quota and a fresh disposable local Git repository, does not change the current phone workspace or `.env`, and requires a source-only edit with a passing independent test and unchanged local remote. The rehearsal mirrors the private `CODEX_ALLOW_FULL_READ` setting; if enabled, broad reads remain possible despite its disposable write target. `--prepare` creates the fixture without a model turn. The edit mode has **not** yet been proved against a real coding turn or live call. It does not add staging, committing or a complete fix-and-push workflow.
-
-For the disposable phone fixture, say **“Run the demo push.”** as a standalone request instead of dictating Git punctuation. The task starts without a read-back or a second “yes.” The daemon expands this shortcut only when `CODEX_APPROVAL_COMMAND` is exactly `git push origin HEAD:refs/heads/phone-demo`. It asks Codex to read the README and request that exact command through the existing approval bridge. Optional “please,” case, whitespace and terminal periods/exclamation marks are accepted; questions, negations and longer requests are not expanded. Missing or different configuration fails before starting a model turn. Starting the task is not **action approval**: PIN authentication plus a one-time explicit decision is still required, and a model success claim without a verified approval fails. Stay on the original call to decide there, or hang up for the callback fallback. The named push is refused unless the configured workspace is the disposable local approval fixture, its Git tree is clean, its single origin is the sibling bare remote and its `phone-demo` ref is absent. The held HEAD, destination and fixture configuration are hashed into the one-use decision and checked again immediately before acceptance; a changed state cancels the approval. After Codex reports completion, the daemon independently checks that the local destination ref equals the held HEAD before reporting task success. This prevents an uncommitted edit or missing ref from being falsely represented as the pushed fix, but it does not add a staging/commit workflow or eliminate a race after the final check. Restart the daemon after daemon-code changes and the voice server after voice-code changes. A new run after a successful push requires a fresh fixture and updated private paths; see the [headline demo runbook](docs/headline-demo.md).
-
-In a normal PowerShell terminal, first run `node --env-file=apps/daemon/.env apps/daemon/scripts/check-demo-push.mjs` before the live test. This read-only check exercises the named-push guard with the daemon's sanitized child environment; a failure means do not approve. Then run `node --env-file=apps/voice-webhook/.env --env-file=apps/daemon/.env apps/daemon/scripts/observe-phone-approval.mjs --check` in another terminal. It refuses a non-disposable workspace, nonlocal origin, wrong protected command, unavailable voice database or nonempty `phone-demo` ref. Run the same observer command with `--watch` **before placing the call**, and leave it open. The watcher reads SQLite and local Git only; it never calls, starts Codex or pushes. It first confirms the empty ref, then reports when the exact real Codex request is held with the ref still absent. Stay on the call and approve the stated action, or hang up and use the PIN-authenticated callback. A final PASS requires the recorded same-call authentication/decision or the PIN-verified post-hangup callback, a completed real task, and the local ref matching the original source HEAD. Any FAIL or timeout means inspect the laptop and remote before retrying; a Codex spoken success claim is not proof. Read-only inspections confirm completed real callback and same-call tasks with matching refs. The new concise narration still needs a fresh live rehearsal.
-
-Controlled speech transcription supplies English language and repository vocabulary hints to the existing `gpt-transcribe` model, following [OpenAI's transcription guidance](https://developers.openai.com/api/docs/guides/transcription#improve-transcription-quality). Hints do not guarantee correct recognition or rewrite text into commands. For the MVP, substantive requests and follow-ups dispatch directly after transcription; there is no task read-back, “yes” step or keypad task confirmation. Greetings, standalone acknowledgments and status questions remain local. Silence and transcription errors do not invent requests; late transcripts after hangup are ignored. An already-dispatched task still survives hangup. Only a currently held protected action enables same-call “approve”/“reject” or keypad 1/2; plain “yes” never authorizes it. Speech decisions are bound to the action present at speech start using the utterance item ID, because [Realtime transcription completion can arrive out of order](https://developers.openai.com/api/docs/guides/realtime-transcription). Missing or stale speech context cannot approve. The callback fallback requires fresh PIN authentication on the separate call. An opt-in task read-back mode is deferred until after the MVP/demo.
-
-On Windows, if `codex` is not on the terminal's PATH, set `CODEX_COMMAND` in the daemon `.env` to the full path of the installed `codex.exe`. Update that path if an app update moves the executable. By default the adapter uses a per-process named permissions profile, grants reads to the demo workspace and minimal runtime paths, disables command network access, and checks that app-server selected that profile before starting a turn. With explicitly approved full reads and edit mode off, it selects the built-in `:read-only` profile without a temporary custom definition and also verifies that the effective sandbox is read-only with network access disabled. This requires the app-server experimental permissions API (checked against CLI `0.158.0-alpha.2`). Startup failures print a stage and error code in the daemon terminal without raw RPC payloads or credentials.
-
-Both the daemon and startup checker use `approvalPolicy: 'on-request'` for thread and turn creation. This lets repository reads run inside the read-only sandbox, following [OpenAI's approval guidance](https://learn.chatgpt.com/docs/agent-approvals-security). The adapter verifies the returned policy and never automatically approves a command based on its text. Without the experimental bridge all requests are denied; with it only the exact pending command can receive a one-time human acceptance. Session grants, host-wide network approvals, file-change approvals and unrelated permission requests are not supported. These settings do not edit global Codex configuration.
-
-In controlled voice mode, acknowledgments and results wait for response completion and Twilio playback marks. An active-response conflict is retried without disconnecting the call. Caller speech cancels voice generation, clears queued playback, truncates unheard audio and discards stale reminders; it does not cancel the Codex task. New results arriving during speech wait until the caller stops. This follows the [Realtime interruption lifecycle](https://developers.openai.com/api/docs/guides/realtime-conversations); real-call audio still needs a fresh check.
-
-To diagnose Codex startup without placing another call, run `node --env-file=apps/daemon/.env apps/daemon/scripts/check-codex.mjs` from a normal terminal at the repository root. It checks account readiness (`account/read`, without a forced token refresh) and effective workspace requirements (`configRequirements/read`) before creating an ephemeral session with the same startup options as the daemon. It prints a redacted startup error or confirms the selected permissions profile, and stops before submitting a model turn. A passing check does not prove model generation or repository investigation works. Run it in the same Windows user environment as the daemon; a nested or isolated sandbox can produce different Windows sandbox errors.
-
-The daemon performs these same readiness checks before starting a thread. Failed model turns preserve known, safe error classifications (workspace requirements, authentication, usage limits, sandbox failures) and allowlisted error/HTTP codes without forwarding raw errors, private details, or tool output to the caller. Retrying errors do not end a task prematurely; a successful final turn still succeeds. Workspace-requirements failures can happen after session creation, so rerun the checker first and inspect the new daemon message if a live task still fails.
-
-To test actual model generation independently of Twilio, add `--run`: `node --env-file=apps/daemon/.env apps/daemon/scripts/check-codex.mjs --run`. This explicitly uses Codex quota for one short reply in an ephemeral session using the configured permissions profile. It shares the daemon's thread/turn settings, asks the model to reply `Codex is ready.` without tools, stops if tool use is observed, and only passes if the turn completes with that exact reply. It does not place a phone call. A passing reply test still does not prove repository inspection or the voice response works. Without `--run`, the checker never requests a model turn. The built-in-profile change is a compatibility candidate for the observed generation-time workspace-requirements error, not a confirmed upstream root cause.
-
-If native Windows startup reports that the elevated sandbox requires effective `:root` read access, the optional `CODEX_ALLOW_FULL_READ=true` setting permits filesystem-wide reads, including outside `CODEX_WORKSPACE`. With edit mode off it selects the built-in read-only profile; with edit mode on it removes the custom profile's root-read denial. Enable it only with the machine owner's consent. This compatibility option alone grants no additional filesystem writes or tool network access. Restart the daemon after changing it.
-
-`GET /health` is a local health check. `POST /voice` and `POST /voice/pin` accept only signed Twilio form webhooks. The WebSocket `/media` endpoint also checks the Twilio signature and requires a one-use token issued only after PIN authentication. Other callers are rejected before the call is answered. Three incorrect or missing PIN submissions lock the caller for 15 minutes. The live server stores call attempts, sessions, machine status, and PIN lockout in SQLite at `./data/agent-phone.db` by default; set `DATABASE_URL=file:./your/path.db` to choose another local file. This directory is ignored by Git. A restart marks unfinished calls ended and connected machines offline until they reconnect. It does not claim an in-flight task completed. In-memory stream tokens are intentionally not restored, so a call interrupted by server restart must call again. The tone is a transport preflight check, not the live agent.
-
-SQLite schema v3 also stores final task results and exact approval permission scope. Durable run events are acknowledged and replayed after a connection drop; event IDs prevent duplicate effects. A fresh active-run snapshot marks tasks lost to a daemon restart as failed/uncertain, never successfully completed or automatically re-executed. Outbound approvals support the fake agent and the explicitly enabled real bridge. Signed terminal callback events record the outbound call outcome; silence, no-answer, failed calls and expiry never approve an action. Each approval gets at most one provider attempt with a 20-second ring timeout. Reconnect can recover a missing attempt but never automatically redial an uncertain one. Keep the database private: it may contain caller numbers, hashed PINs, prompts, callback nonces, and protected command descriptions.
-
-The preflight uses a small implementation of Twilio's documented form-signature algorithm because package installation was unavailable in the initial workspace. Replace it with the official Twilio SDK validator before expanding beyond the single Voice form webhook.
-
-## Live call status
-
-While a Codex task is running on an active call, the voice server gives a neutral status after about 15 seconds and then about every 30 seconds. It defers reminders while caller speech is detected. Safe, adapter-owned progress milestones are spoken when available, or held until the caller stops speaking; a useful milestone resets the reminder timer. A standalone status question does not create a new task. Reminders stop when approval is needed, the task completes or the call ends. Neutral reminders are local state updates, not a claim that Codex made progress.
-
-After a hangup, call again, pass the PIN and say **“status”** to hear the most recent task's recorded state without starting another turn. A completed short answer can be repeated; a long answer again offers summary or details. An offline machine makes a still-running outcome uncertain, and a new inbound call cannot approve a protected action. The reconnect status is scoped to the authenticated user; it does not attach the new call to the old Codex thread or cancel the old task.
-
-When a Codex task finishes during the call, a short answer is spoken directly. For a longer answer, the caller hears a summary-or-details choice. Say **“summary”** for a short extract grounded in the completed result, or **“details”** to hear the full answer in sections; say **“continue”** for the next section or **“repeat”** for the previous one. These commands do not start another Codex task. A substantive follow-up starts directly on the same Codex thread without a task read-back. The full result stays in the task record even if the caller does not hear every section. This delivery flow has automated coverage; its pacing still needs a live audio check.
-
-If more than one matching agent is online when a request arrives, the server reads a numbered list of agent and machine names. Say **“select one”** (or another listed number), listen to the selected name, then say **“yes connect”** to dispatch that request. Say **“no”** to choose again. This is target selection, not a read-back of every task. The choice expires after one minute or hangup, and an offline option cannot receive the task. With one eligible agent, dispatch is immediate. Once the session has an agent, follow-up questions remain with that exact agent. This menu has automated coverage and needs a live speech check.
-
-While a task is queued or running, say **“cancel the current task”** and then **“yes, stop it”** to request cancellation. The first phrase alone does nothing, and a failed transcription or a 15-second pause clears the confirmation. The server reports the task stopped only after the daemon confirms cancellation; if delivery fails, check the laptop before retrying. Once the task is paused for a protected action, say **“reject”** or press **2** on the original authenticated call, or reject through its authenticated callback. A normal hangup does not cancel the task.
-
-To redirect an active Codex turn, say **“steer the task: focus on failing tests first”** (or begin with **“actually”**). The server reads back the complete change and waits for **“yes, steer it”**; **“no, keep working”**, failed transcription, hangup or 15 seconds without confirmation discards the draft. The daemon sends [Codex app-server `turn/steer`](https://learn.chatgpt.com/docs/app-server) with the exact active thread and expected turn ID, and the phone reports acceptance only after that RPC confirms it. Steering does not start another task, change model or permissions, or approve a protected action. If Codex has not started, has already finished, or the acknowledgment is lost, no success is claimed; check the laptop. This path is automated-test verified but still needs a real-call check.
+- [Architecture](docs/architecture.md) — components, data boundaries, and
+  safety model.
+- [Protected local-release runbook](docs/headline-demo.md) — the primary
+  callback-first demo and reset instructions.
+- [Synthetic monitor demo](docs/site-monitor-demo.md) — the secondary phone
+  alert demo.
+- [Team handoffs](docs/team/README.md) — isolated work specifications for
+  active teammates.
+- [Poster mockup provenance](docs/poster/daemon-dashboard-mockup-prompt.md) —
+  explains that the dashboard image is a concept, not a product screenshot.

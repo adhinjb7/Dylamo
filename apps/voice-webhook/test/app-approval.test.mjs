@@ -23,7 +23,8 @@ async function waitFor(predicate, timeoutMs = 3000) {
   }
 }
 
-async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 'Push the demo branch.', decisionMode = 'callback', additionalPermissions = null) {
+async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 'Push the demo branch.', decisionMode = 'callback', additionalPermissions = null,
+  callbackDecisionMode = 'dtmf') {
   const isCodex = mode === 'codex';
   const fixture = isCodex ? prepareApprovalRehearsal(join(tmpdir(), 'dylamo-approval-rehearsals')) : null;
   const codexWorkspace = fixture?.workspace ?? process.cwd();
@@ -95,6 +96,13 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     },
     body: new URLSearchParams(params),
   });
+  const callbackDecisionInput = () => callbackDecisionMode === 'speech-push'
+    ? { SpeechResult: 'Push the demo repo.' }
+    : callbackDecisionMode === 'speech'
+      ? { SpeechResult: choice === '1' ? 'Approve.' : 'Reject.' }
+      : { Digits: choice };
+  const callbackDetailsInput = () => callbackDecisionMode === 'dtmf'
+    ? { Digits: '3' } : { SpeechResult: 'Details.' };
   try {
     client.start();
     await waitFor(() => store.getMachine(machineId)?.status === 'online');
@@ -272,7 +280,7 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
       if (isCodex) assert.equal(fixture.remoteCommit(), '', 'an unavailable callback cannot push');
       return;
     }
-    assert.match(await (await post(decisionPath, { ...outbound, Digits: choice })).text(), /<Hangup\/>/);
+    assert.match(await (await post(decisionPath, { ...outbound, ...callbackDecisionInput() })).text(), /<Hangup\/>/);
     assert.equal(store.getApproval(approvalId).state, 'pending');
     const wrongSid = { ...outbound, CallSid: `CA${'d'.repeat(32)}` };
     assert.match(await (await post(callbackPath, wrongSid)).text(), /<Hangup\/>/);
@@ -283,25 +291,34 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     assert.match(await (await post(pinPath, { ...outbound, Digits: '9999' })).text(), /Say your four PIN digits/);
     assert.equal(store.getApprovalCallback(approvalId).pin_verified, 0);
     const brief = await (await post(pinPath, { ...outbound, SpeechResult: 'one two three four' })).text();
-    assert.match(brief, /Press 1 to approve/);
+    assert.match(brief, /<Gather input="dtmf speech" numDigits="1"/);
+    assert.match(brief, /Say approve or push the demo repo to allow once/);
     assert.equal(brief.includes(runtimeCommand) || brief.includes(codexWorkspace), additionalPermissions != null);
     assert.match(brief, additionalPermissions ? /Extra permissions/ : isCodex ? /prepared changes to the local demo branch/ : /practice push/);
     if (additionalPermissions) assert.doesNotMatch(brief, /Nothing goes to GitHub|prepared changes/);
     assert.equal(store.getApprovalCallback(approvalId).pin_verified, 1);
-    const details = await (await post(decisionPath, { ...outbound, Digits: '3' })).text();
+    const details = await (await post(decisionPath, { ...outbound, ...callbackDetailsInput() })).text();
     // XML escapes the Windows wrapper quotes while retaining the exact command body.
     assert.match(details, /git push/);
     assert.ok(details.includes(isCodex ? codexWorkspace : 'demo-repository'));
     assert.equal(store.getApproval(approvalId).state, 'pending');
     assert.deepEqual(decisions, [], 'details never authorize a command');
+    for (const input of [{ Digits: '1', SpeechResult: 'Reject.' }, { Digits: '1', SpeechResult: '' },
+      { Digits: '', SpeechResult: 'Approve.' }, { SpeechResult: 'Yes.' }, { SpeechResult: 'Push main.' },
+      { SpeechResult: 'Approve, but only if the tests pass.' }]) {
+      const rejected = await (await post(decisionPath, { ...outbound, ...input })).text();
+      assert.match(rejected, /prepared changes|practice push|Extra permissions/i);
+      assert.equal(store.getApproval(approvalId).state, 'pending', 'ambiguous or qualified speech must not authorize a command');
+      assert.deepEqual(decisions, [], 'invalid speech must not reach the daemon');
+    }
     const repeat = await (await post(decisionPath, { ...outbound, Digits: '' })).text();
     assert.match(repeat, additionalPermissions ? /Extra permissions/ : isCodex ? /prepared changes to the local demo branch/ : /practice push/);
     assert.equal(repeat.includes('git push'), additionalPermissions != null, 'no input returns to the default prompt');
-    const result = await (await post(decisionPath, { ...outbound, Digits: choice })).text();
+    const result = await (await post(decisionPath, { ...outbound, ...callbackDecisionInput() })).text();
     assert.match(result, choice === '1' ? /Approved/ : /Rejected/);
     assert.equal(store.getApproval(approvalId).state, choice === '1' ? 'approved' : 'rejected');
     await waitFor(() => store.getTask(task.id).state === (choice === '1' ? 'completed' : 'failed'));
-    assert.match(await (await post(decisionPath, { ...outbound, Digits: choice })).text(), /no longer available/);
+    assert.match(await (await post(decisionPath, { ...outbound, ...callbackDecisionInput() })).text(), /no longer available/);
     assert.equal(callbackRequests.length, 1);
     if (isCodex) {
       assert.deepEqual(decisions, [choice === '1' ? 'accept' : 'cancel']);
@@ -344,6 +361,12 @@ test('demo push shortcut survives hangup and accepts only after PIN and DTMF', (
   runApprovalFlow('1', 'codex', undefined, 'Run the demo push.'));
 test('demo push shortcut survives hangup and cancels after PIN and DTMF rejection', () =>
   runApprovalFlow('2', 'codex', undefined, 'Run the demo push.'));
+
+for (const choice of ['1', '2']) test(`callback speech ${choice === '1' ? 'approval' : 'rejection'} is PIN-bound and one-use`, () =>
+  runApprovalFlow(choice, 'codex', undefined, 'Run the demo push.', 'callback', null, 'speech'));
+
+test('callback accepts the explicit spoken demo-push phrase after PIN verification', () =>
+  runApprovalFlow('1', 'codex', undefined, 'Run the demo push.', 'callback', null, 'speech-push'));
 
 test('extra permission requests retain the full disclosure rather than a brief demo summary', () =>
   runApprovalFlow('1', 'codex', undefined, 'Run the demo push.', 'callback', { network: { enabled: true } }));

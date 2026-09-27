@@ -523,29 +523,31 @@ test('dirty or unverifiable demo push state fails before a phone approval is off
   } finally { f.agent.stop(); }
 });
 
-test('demo push shortcut sends the exact configured action but still waits for rejection', async () => {
+test('demo push shortcuts send the exact configured action but still wait for rejection', async () => {
   const command = 'git push origin HEAD:refs/heads/phone-demo';
-  const f = fixture(true, { approvalCommand: command });
-  f.start.prompt = 'Run the demo push.';
-  try {
-    await startTurn(f);
-    const prompt = f.requests.find(request => request.method === 'turn/start').params.input[0].text;
-    assert.ok(prompt.includes(command), 'the model receives the literal configured command, not spoken punctuation');
-    assert.match(prompt, /not approval/i);
-    assert.match(prompt, /Do not modify or commit files/);
-    assert.equal(f.sent.some(event => event.type === 'approval.required'), false);
-    f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
-      threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: process.cwd(),
-    } });
-    await f.tick();
-    const approval = f.sent.at(-1);
-    assert.equal(approval.type, 'approval.required');
-    assert.equal(f.requests.some(request => request.id === 91), false, 'shortcut is not authorization');
-    assert.equal(f.agent.receive({ ...approval, type: 'approval.response', approved: false }), true);
-    assert.deepEqual(f.requests.filter(request => request.id === 91), [{ id: 91, result: { decision: 'cancel' } }]);
-    assert.equal(f.sent.at(-1).type, 'task.failed');
-    assert.equal(f.requests.some(request => request.result?.decision === 'accept'), false);
-  } finally { f.agent.stop(); }
+  for (const spokenPrompt of ['Run the demo push.', 'Push the demo repo.']) {
+    const f = fixture(true, { approvalCommand: command });
+    f.start.prompt = spokenPrompt;
+    try {
+      await startTurn(f);
+      const prompt = f.requests.find(request => request.method === 'turn/start').params.input[0].text;
+      assert.ok(prompt.includes(command), 'the model receives the literal configured command, not spoken punctuation');
+      assert.match(prompt, /not approval/i);
+      assert.match(prompt, /Do not modify or commit files/);
+      assert.equal(f.sent.some(event => event.type === 'approval.required'), false);
+      f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+        threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: process.cwd(),
+      } });
+      await f.tick();
+      const approval = f.sent.at(-1);
+      assert.equal(approval.type, 'approval.required');
+      assert.equal(f.requests.some(request => request.id === 91), false, 'shortcut is not authorization');
+      assert.equal(f.agent.receive({ ...approval, type: 'approval.response', approved: false }), true);
+      assert.deepEqual(f.requests.filter(request => request.id === 91), [{ id: 91, result: { decision: 'cancel' } }]);
+      assert.equal(f.sent.at(-1).type, 'task.failed');
+      assert.equal(f.requests.some(request => request.result?.decision === 'accept'), false);
+    } finally { f.agent.stop(); }
+  }
 });
 
 test('demo push shortcut fails before launching Codex when its command is not configured', () => {

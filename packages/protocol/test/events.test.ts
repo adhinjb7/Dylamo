@@ -25,6 +25,23 @@ test('requires correlation IDs on run events and rejects unknown versions', () =
   assert.equal(DaemonEvent.safeParse({ ...message, v: 2 }).success, false);
 });
 
+test('accepts only the narrow local synthetic-monitor event shape', () => {
+  const incident = {
+    ...common,
+    type: 'site_monitor.incident',
+    monitorId: 'local-checkout',
+    condition: 'http_errors',
+    incidentId: 'synthetic-checkout-1',
+    observedAt: '2026-09-27T12:00:00.000Z',
+  };
+  assert.equal(DaemonEvent.safeParse(incident).success, true);
+  assert.equal(DaemonEvent.safeParse({ ...incident, condition: 'database_down' }).success, false);
+  assert.equal(DaemonEvent.safeParse({ ...incident, destination: '+15555550123' }).success, false);
+  const { condition: _condition, ...recovery } = incident;
+  assert.equal(DaemonEvent.safeParse({ ...recovery, type: 'site_monitor.recovered' }).success, true);
+  assert.equal(DaemonEvent.safeParse({ ...incident, type: 'site_monitor.recovered' }).success, false);
+});
+
 test('Codex run identity requires both thread and turn IDs', () => {
   const started = { ...common, ...run, type: 'agent.started', codexThreadId: 'thread-1', codexTurnId: 'turn-1' };
   assert.equal(DaemonEvent.safeParse(started).success, true);

@@ -74,7 +74,7 @@ test('version one database upgrades to callback schema without losing calls', ()
     } finally { upgraded.close(); }
     const check = new DatabaseSync(path, { readOnly: true });
     try {
-      assert.equal(check.prepare('PRAGMA user_version').get().user_version, 3);
+      assert.equal(check.prepare('PRAGMA user_version').get().user_version, 4);
       assert.ok(check.prepare('PRAGMA table_info(tasks)').all().some(column => column.name === 'result_text'));
       assert.ok(check.prepare('PRAGMA table_info(approvals)').all().some(column => column.name === 'permission_scope'));
     } finally { check.close(); }
@@ -83,6 +83,62 @@ test('version one database upgrades to callback schema without losing calls', ()
     if (!target.startsWith(resolve(tmpdir()) + sep)) throw new Error('refusing to remove unexpected test directory');
     rmSync(target, { recursive: true, force: true });
   }
+});
+
+test('site monitor incidents are one-per-active-condition and never reuse approval state', () => {
+  let time = 1_000;
+  withMemoryStore(store => {
+    const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
+    const machineId = randomUUID();
+    store.ensureMachine({ machineId, userId: user.id, tokenHash: '0'.repeat(64) });
+    const first = store.createSiteMonitorIncident({ machineId, monitorId: 'local-checkout',
+      condition: 'slow_response', observedAt: 1_000 });
+    assert.equal(first.created, true);
+    assert.equal(first.incident.state, 'active');
+    assert.equal(first.incident.callback_state, 'planned');
+    assert.equal(store.createSiteMonitorIncident({ machineId, monitorId: 'local-checkout',
+      condition: 'http_errors', observedAt: 1_100 }).created, false, 'a worsening incident cannot redial');
+
+    const callbackSid = `CA${'c'.repeat(32)}`;
+    assert.equal(store.bindSiteMonitorCallback(first.incident.id, 'wrong', callbackSid), false);
+    assert.equal(store.bindSiteMonitorCallback(first.incident.id, first.incident.callback_nonce, callbackSid), true);
+    assert.equal(store.finishSiteMonitorCallback({ incidentId: first.incident.id, callSid: callbackSid,
+      reportDecision: 'declined' }), true);
+    assert.equal(store.finishSiteMonitorCallback({ incidentId: first.incident.id, callSid: callbackSid,
+      reportDecision: 'requested' }), false, 'the report answer is one-use');
+    assert.equal(store.getSiteMonitorIncident(first.incident.id).report_decision, 'declined');
+    assert.equal(store.getActiveSiteMonitorIncident(machineId).id, first.incident.id);
+
+    time = 2_000;
+    assert.equal(store.resolveSiteMonitorIncident({ machineId, monitorId: 'local-checkout', observedAt: 2_000 }), true);
+    assert.equal(store.getActiveSiteMonitorIncident(machineId), undefined);
+    assert.equal(store.createSiteMonitorIncident({ machineId, monitorId: 'local-checkout',
+      condition: 'http_errors', observedAt: 1_500 }).stale, true, 'a delayed pre-recovery alert cannot reopen it');
+    const later = store.createSiteMonitorIncident({ machineId, monitorId: 'local-checkout',
+      condition: 'http_errors', observedAt: 3_000 });
+    assert.equal(later.created, true);
+    assert.notEqual(later.incident.id, first.incident.id);
+    assert.equal(store.getApproval(randomUUID()), undefined, 'monitor data never creates an approval');
+  }, () => time);
+});
+
+test('site monitor callback completion tolerates the Twilio status race without redialing', () => {
+  withMemoryStore(store => {
+    const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
+    const machineId = randomUUID();
+    store.ensureMachine({ machineId, userId: user.id, tokenHash: '0'.repeat(64) });
+    const created = store.createSiteMonitorIncident({ machineId, monitorId: 'local-checkout',
+      condition: 'http_errors', observedAt: 1_000 }).incident;
+    const callbackSid = `CA${'d'.repeat(32)}`;
+    assert.equal(store.recordSiteMonitorCallbackEnd({ incidentId: created.id, nonce: created.callback_nonce,
+      callSid: callbackSid, status: 'no-answer' }), true);
+    assert.equal(store.markSiteMonitorCallbackDialed(created.id, callbackSid), false,
+      'a late REST response cannot turn the failed call into another notification or a false success log');
+    assert.equal(store.bindSiteMonitorCallback(created.id, created.callback_nonce, callbackSid), false);
+    assert.equal(store.recordSiteMonitorCallbackEnd({ incidentId: created.id, nonce: created.callback_nonce,
+      callSid: callbackSid, status: 'no-answer' }), false);
+    assert.equal(store.getSiteMonitorIncident(created.id).callback_state, 'failed');
+  });
 });
 
 test('task and run states persist independently of a call ending', () => {

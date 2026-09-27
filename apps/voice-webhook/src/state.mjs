@@ -52,6 +52,24 @@ CREATE TABLE IF NOT EXISTS approval_callbacks (
   state TEXT NOT NULL CHECK(state IN ('planned','dialed','finished','failed')),
   created_at INTEGER NOT NULL
 ) STRICT;
+-- A site-monitor incident is intentionally independent of tasks and approvals.
+-- It represents one bounded, local demo condition and may place at most one
+-- outbound notification call until a later recovered event closes it.
+CREATE TABLE IF NOT EXISTS site_monitor_incidents (
+  id TEXT PRIMARY KEY,
+  machine_id TEXT NOT NULL REFERENCES machines(id),
+  monitor_id TEXT NOT NULL CHECK(monitor_id IN ('local-checkout')),
+  condition TEXT NOT NULL CHECK(condition IN ('slow_response','http_errors')),
+  state TEXT NOT NULL CHECK(state IN ('active','resolved')),
+  callback_nonce TEXT NOT NULL UNIQUE,
+  callback_call_sid TEXT UNIQUE,
+  callback_state TEXT NOT NULL CHECK(callback_state IN ('planned','dialed','finished','failed')),
+  callback_completed_at INTEGER,
+  report_decision TEXT CHECK(report_decision IN ('requested','declined')),
+  observed_at INTEGER NOT NULL,
+  detected_at INTEGER NOT NULL,
+  resolved_at INTEGER
+) STRICT;
 CREATE TABLE IF NOT EXISTS audit_events (
   id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id), type TEXT NOT NULL,
   redacted_payload TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -69,6 +87,8 @@ CREATE INDEX IF NOT EXISTS idx_task_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_run_task ON agent_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_approval_run ON approvals(run_id);
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_site_monitor_incident
+  ON site_monitor_incidents(machine_id, monitor_id) WHERE state='active';
 `;
 
 export function databasePathFromUrl(value = 'file:./data/agent-phone.db') {
@@ -84,7 +104,7 @@ export function openStateStore(path, { now = Date.now } = {}) {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
   const version = db.prepare('PRAGMA user_version').get().user_version;
-  if (version > 3) {
+  if (version > 4) {
     db.close();
     throw new Error('database schema is newer than this application');
   }
@@ -94,6 +114,7 @@ export function openStateStore(path, { now = Date.now } = {}) {
     if (!db.prepare('PRAGMA table_info(approvals)').all().some(column => column.name === 'permission_scope')) db.exec('ALTER TABLE approvals ADD COLUMN permission_scope TEXT');
     db.exec('PRAGMA user_version = 3');
   }
+  if (version < 4) db.exec('PRAGMA user_version = 4');
 
   function transaction(work) {
     db.exec('BEGIN IMMEDIATE');
@@ -310,6 +331,114 @@ export function openStateStore(path, { now = Date.now } = {}) {
       WHERE approval_id=? AND call_sid=? AND state='dialed'`).run(approvalId, callSid);
   }
 
+  function createSiteMonitorIncident({ machineId, monitorId, condition, observedAt }, { inTransaction = false } = {}) {
+    if (monitorId !== 'local-checkout' || !['slow_response', 'http_errors'].includes(condition) ||
+        !Number.isInteger(observedAt) || observedAt <= 0) {
+      throw new Error('invalid site monitor incident');
+    }
+    const work = () => {
+      if (!db.prepare('SELECT 1 FROM machines WHERE id=?').get(machineId)) throw new Error('unknown monitor machine');
+      const active = db.prepare(`SELECT * FROM site_monitor_incidents
+        WHERE machine_id=? AND monitor_id=? AND state='active'`).get(machineId, monitorId);
+      if (active) return { incident: active, created: false, stale: false };
+      // A delayed alert from before the last recovery must not reopen an
+      // incident after the daemon has already reported healthy again.
+      const resolved = db.prepare(`SELECT * FROM site_monitor_incidents
+        WHERE machine_id=? AND monitor_id=? AND state='resolved'
+        ORDER BY resolved_at DESC, rowid DESC LIMIT 1`).get(machineId, monitorId);
+      if (resolved && observedAt <= resolved.observed_at) return { incident: resolved, created: false, stale: true };
+      const id = randomUUID();
+      const nonce = randomBytes(24).toString('hex');
+      const time = now();
+      db.prepare(`INSERT INTO site_monitor_incidents
+        (id, machine_id, monitor_id, condition, state, callback_nonce, callback_state, observed_at, detected_at)
+        VALUES (?, ?, ?, ?, 'active', ?, 'planned', ?, ?)`)
+        .run(id, machineId, monitorId, condition, nonce, observedAt, time);
+      audit(null, 'site_monitor.incident', { incidentId: id, machineId, monitorId, condition });
+      return { incident: db.prepare('SELECT * FROM site_monitor_incidents WHERE id=?').get(id), created: true, stale: false };
+    };
+    return inTransaction ? work() : transaction(work);
+  }
+
+  function resolveSiteMonitorIncident({ machineId, monitorId, observedAt }, { inTransaction = false } = {}) {
+    if (monitorId !== 'local-checkout' || !Number.isInteger(observedAt) || observedAt <= 0) {
+      throw new Error('invalid site monitor recovery');
+    }
+    const work = () => {
+      const incident = db.prepare(`SELECT * FROM site_monitor_incidents
+        WHERE machine_id=? AND monitor_id=? AND state='active'`).get(machineId, monitorId);
+      if (!incident || observedAt < incident.observed_at) return false;
+      const time = now();
+      db.prepare(`UPDATE site_monitor_incidents SET state='resolved', observed_at=?, resolved_at=?
+        WHERE id=? AND state='active'`).run(observedAt, time, incident.id);
+      audit(null, 'site_monitor.recovered', { incidentId: incident.id, machineId, monitorId });
+      return true;
+    };
+    return inTransaction ? work() : transaction(work);
+  }
+
+  function bindSiteMonitorCallback(incidentId, nonce, callSid) {
+    if (!/^CA[0-9a-fA-F]{32}$/.test(callSid)) return false;
+    const result = db.prepare(`UPDATE site_monitor_incidents SET callback_call_sid=?, callback_state='dialed'
+      WHERE id=? AND callback_nonce=? AND state='active' AND callback_completed_at IS NULL
+      AND callback_state IN ('planned','dialed') AND (callback_call_sid IS NULL OR callback_call_sid=?)`)
+      .run(callSid, incidentId, nonce, callSid);
+    return result.changes === 1;
+  }
+
+  function markSiteMonitorCallbackDialed(incidentId, callSid) {
+    if (!/^CA[0-9a-fA-F]{32}$/.test(callSid)) throw new Error('invalid callback call SID');
+    const prior = db.prepare(`SELECT callback_call_sid, callback_state, callback_completed_at
+      FROM site_monitor_incidents WHERE id=?`).get(incidentId);
+    // Twilio can invoke the webhook or status URL before its REST response is
+    // available locally. A later response for that same terminal call is safe
+    // to ignore; a different SID is never accepted.
+    if (!prior || (prior.callback_call_sid && prior.callback_call_sid !== callSid)) return false;
+    // A terminal webhook may arrive before the REST create call resolves. It
+    // is already recorded and must not be reported as a newly initiated call.
+    if (prior.callback_completed_at != null) return false;
+    const result = db.prepare(`UPDATE site_monitor_incidents SET callback_call_sid=?, callback_state='dialed'
+      WHERE id=? AND state='active' AND callback_completed_at IS NULL
+      AND callback_state IN ('planned','dialed') AND (callback_call_sid IS NULL OR callback_call_sid=?)`)
+      .run(callSid, incidentId, callSid);
+    return result.changes === 1;
+  }
+
+  function markSiteMonitorCallbackFailed(incidentId) {
+    return db.prepare(`UPDATE site_monitor_incidents SET callback_state='failed'
+      WHERE id=? AND state='active' AND callback_state='planned' AND callback_call_sid IS NULL`)
+      .run(incidentId).changes === 1;
+  }
+
+  function recordSiteMonitorCallbackEnd({ incidentId, nonce, callSid, status }) {
+    const terminal = new Set(['completed', 'busy', 'failed', 'no-answer', 'canceled']);
+    if (!terminal.has(status) || !/^CA[0-9a-fA-F]{32}$/.test(callSid)) return false;
+    return transaction(() => {
+      const incident = db.prepare('SELECT * FROM site_monitor_incidents WHERE id=? AND callback_nonce=?').get(incidentId, nonce);
+      if (!incident || incident.callback_completed_at != null ||
+          (incident.callback_call_sid && incident.callback_call_sid !== callSid)) return false;
+      const time = now();
+      const outcome = incident.callback_state === 'finished' ? 'finished' : 'failed';
+      db.prepare(`UPDATE site_monitor_incidents SET callback_call_sid=?, callback_state=?, callback_completed_at=?
+        WHERE id=? AND callback_completed_at IS NULL`).run(callSid, outcome, time, incidentId);
+      audit(null, 'site_monitor.callback_ended', { incidentId, status });
+      return true;
+    });
+  }
+
+  function finishSiteMonitorCallback({ incidentId, callSid, reportDecision }) {
+    if (!['requested', 'declined'].includes(reportDecision) || !/^CA[0-9a-fA-F]{32}$/.test(callSid)) return false;
+    return transaction(() => {
+      const result = db.prepare(`UPDATE site_monitor_incidents SET callback_state='finished', report_decision=?
+        WHERE id=? AND callback_call_sid=? AND state='active' AND callback_state='dialed'
+        AND callback_completed_at IS NULL AND report_decision IS NULL`)
+        .run(reportDecision, incidentId, callSid);
+      if (!result.changes) return false;
+      audit(null, 'site_monitor.report_decision', { incidentId, reportDecision });
+      return true;
+    });
+  }
+
   function decideApproval({ approvalId, runId, actionDigest, userId, approved, inboundCallSid = null }) {
     if (typeof approved !== 'boolean') throw new Error('approval decision must be explicit');
     return transaction(() => {
@@ -401,6 +530,9 @@ export function openStateStore(path, { now = Date.now } = {}) {
     prepareApprovalCallback, markApprovalCallbackDialed, recordApprovalCallEnd,
     markApprovalCallbackFailed, bindApprovalCallback, verifyApprovalCallbackPin,
     finishApprovalCallback, applyEventOnce, audit, recoverAfterRestart,
+    createSiteMonitorIncident, resolveSiteMonitorIncident,
+    bindSiteMonitorCallback, markSiteMonitorCallbackDialed, markSiteMonitorCallbackFailed,
+    recordSiteMonitorCallbackEnd, finishSiteMonitorCallback,
     unfinishedRunsForMachine, reconcileMachineRuns,
     setTaskResult: (taskId, text) => db.prepare('UPDATE tasks SET result_text=? WHERE id=?').run(text.slice(0, 4000), taskId),
     getCall: (callSid) => db.prepare('SELECT * FROM call_attempts WHERE call_sid=?').get(callSid),
@@ -425,6 +557,9 @@ export function openStateStore(path, { now = Date.now } = {}) {
       FROM approvals a JOIN agent_runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
       JOIN sessions s ON s.id=t.session_id WHERE a.id=?`).get(approvalId),
     getApprovalCallback: (approvalId) => db.prepare('SELECT * FROM approval_callbacks WHERE approval_id=?').get(approvalId),
+    getSiteMonitorIncident: (incidentId) => db.prepare('SELECT * FROM site_monitor_incidents WHERE id=?').get(incidentId),
+    getActiveSiteMonitorIncident: (machineId, monitorId = 'local-checkout') => db.prepare(`SELECT * FROM site_monitor_incidents
+      WHERE machine_id=? AND monitor_id=? AND state='active'`).get(machineId, monitorId),
     getPendingApprovalForSession: (sessionId) => db.prepare(`SELECT a.id FROM approvals a
       JOIN agent_runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
       WHERE t.session_id=? AND a.state='pending' AND a.expires_at>? ORDER BY a.expires_at LIMIT 1`).get(sessionId, now()),

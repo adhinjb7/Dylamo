@@ -1,147 +1,129 @@
-# Local headline release demo
+# Protected local-release demo
 
-This is the reliable **prepared-change** demo, not an autonomous edit. A fresh
-disposable Git repository contains two commits: a baseline page headed “Dylamo
-demo site,” then a clean prepared commit headed “Hello, Hack Atlantic!” The
-local preview shows the baseline until the separate bare remote gains the exact
-`phone-demo` branch. It does not deploy to GitHub or a public website.
+This is the primary Dylamo demo. It proves that a task can continue after a
+caller hangs up, a real callback can return the human to the loop, and one
+exact protected action needs a one-use phone approval.
 
-## Prepare and preview
+It is intentionally a **prepared-change** demo. Codex requests a local push of
+a prepared commit to a fresh disposable bare repository. It does not edit the
+Dylamo project, push to GitHub, or deploy a public website.
 
-In a normal PowerShell terminal at the Dylamo repository root, run:
+## What the audience sees
+
+1. A local preview starts navy and says **Dylamo demo site**.
+2. The caller asks Dylamo to “Run the demo push” (or “Push the demo repo”), then hangs up.
+3. Dylamo calls back, authenticates the caller again, and briefly explains the
+   effect: publish prepared changes to the **local demo branch** only.
+4. The caller approves once. The preview turns green and says **Hello, Hack
+   Atlantic!**
+
+## First rehearsal: prepare safely
+
+Run these commands in a normal PowerShell terminal from the repository root:
 
 ```powershell
+npm run build:protocol
 node apps/daemon/scripts/headline-demo.mjs --serve
 ```
 
-Keep that terminal open and open `http://127.0.0.1:4173/`. It should say
-“Dylamo demo site” and “Before local approval.” The script prints the new
-disposable `CODEX_WORKSPACE` and `GIT_CONFIG_GLOBAL` paths. It makes no Codex
-turn, phone call or push. Use `--prepare` instead if you only want to inspect
-the fixture without starting the preview.
+Keep the preview terminal open and visit `http://127.0.0.1:4173/`. It should
+show the navy baseline. The script prints a fresh disposable `CODEX_WORKSPACE`
+and `GIT_CONFIG_GLOBAL` path. Put only those two printed paths in the private
+`apps/daemon/.env`. The daemon pins the other isolation settings itself.
 
-For a repeat after a successful push, stop only the old preview terminal with
-Ctrl+C before running this command again. It creates a new fixture; it does
-not reset or delete the old one. Update the two private paths below to match.
+For the named demo action, the daemon `.env` must also keep these values:
 
-In the **ignored, private** daemon `.env`, set `CODEX_WORKSPACE` and
-`GIT_CONFIG_GLOBAL` to the paths just printed. For this one named action,
-keep `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`,
-`CODEX_APPROVAL_COMMAND=git push origin HEAD:refs/heads/phone-demo`, and
-`CODEX_ALLOW_WORKSPACE_WRITE=false`. Do not replace the Dylamo GitHub remote
-with this local fixture. Keep credentials private and do not commit `.env`.
+```ini
+CODEX_APPROVAL_COMMAND=git push origin HEAD:refs/heads/phone-demo
+CODEX_ALLOW_WORKSPACE_WRITE=false
+```
 
-The voice `.env` needs its existing real Codex/approval settings, including
-`AGENT_MODE=codex` and `CODEX_APPROVAL_ENABLED=true`. After installing the short
-approval prompts, run `npm run build:protocol` and restart **both** the voice
-server and daemon (new action-description metadata crosses that connection).
-There are no new environment flags or database columns. Keep ngrok running.
-Restart the relevant server after any `.env` change. Before calling, run
-these from another normal PowerShell terminal:
+Do **not** point the Dylamo GitHub remote at this fixture. The fixture's
+`origin` is a sibling local bare repository created in a temporary folder.
+
+The private voice `.env` needs the already-working live configuration:
+`VOICE_MODE=realtime`, `AGENT_MODE=codex`, `CODEX_APPROVAL_ENABLED=true`, a
+Twilio number, your allowlisted caller number, and a configured PIN. Keep ngrok
+running. Restart the daemon and voice webhook after changing either `.env` or
+after rebuilding the protocol.
+
+Before any call, run:
 
 ```powershell
 node --env-file=apps/daemon/.env apps/daemon/scripts/check-demo-push.mjs
 node --env-file=apps/voice-webhook/.env --env-file=apps/daemon/.env apps/daemon/scripts/observe-phone-approval.mjs --check
 ```
 
-Both must pass. Then start the watcher with the same command ending in
-`--watch` and leave it open **before** the call.
+Both must print `PASS`. These checks do not start a model turn, place a phone
+call, or push anything.
 
-## Callback-first presentation
+## Low-risk Codex rehearsal
 
-This one flow demonstrates delegation, work continuing after hangup, a real
-callback, human approval and a visible local release. No second editing flow
-is needed for the one-minute presentation.
+Before a live phone test, run this exact reject rehearsal:
 
-1. Show the baseline preview. Call, say your PIN digits and ask “Run the demo
-   push.” Wait for the acknowledgment that the task started, then hang up.
-2. The watcher must report the exact request held pending while the local
-   destination is still empty. The website must still show the baseline.
-3. Answer the callback: “Dylamo calling. Say your four PIN digits, or enter
-   them.” Speak the PIN. No action details are disclosed before authentication.
-4. Hear: “Ready to publish the prepared changes to the local demo branch.
-   Nothing goes to GitHub. Press 1 to approve once, 2 to reject, or 3 for details.”
-   Press **1** if that matches your request; **2** rejects. The long command and
-   temporary Windows path are available on **3**, not read by default.
-5. Hear the short result, require the watcher's verified-ref PASS and refresh
-   the preview. Explain that this is a local release of a prepared change,
-   not a GitHub deployment or autonomous editing.
+```powershell
+node --env-file=apps/daemon/.env apps/daemon/scripts/rehearse-approval.mjs --run --decision=reject
+```
 
-For a strict one-minute slot, start the task shortly before presenting and
-say plainly that it is already running. Do not approve before the demonstration
-or imply the earlier request was made on stage. The callback timing still
-depends on Codex, the tunnel and the carrier; shorter narration is not a
-one-minute completion guarantee. Approval expires after five minutes. Keep
-a clearly labeled recording as backup; do not claim a failed live run worked.
+It uses one short Codex turn but never calls a phone, touches GitHub, or pushes
+the local branch. It verifies that the exact command is held and remains blocked
+after rejection. It can take up to two minutes.
 
-## Same-call option
+## Full callback trial
 
-1. Show the preview's old heading. Call the number and authenticate once by
-   typing the four-digit PIN **or saying each digit separately**.
-2. Say “Run the demo push.” The task starts directly, without a read-back,
-   second “yes” or keypad confirmation. Do not hang up before it has started.
-3. Stay on the call. Wait for the held protected-action message. The watcher
-   must show the pending real Codex request and an empty `phone-demo` ref.
-4. Listen to the short explanation of the action's effect and destination.
-   Say **“approve”** or press **1** to allow it once. If it sounds wrong, say
-   **“reject”** or press **2**. Say **“details”** or press **3** for the exact
-   command and directory; **“repeat”** repeats the short summary. There is no
-   second PIN or callback while you remain on this authenticated call.
-5. Require the watcher to confirm the same-call PIN-authenticated decision, completed task and
-   local destination ref equal to the held source HEAD. Refresh the preview;
-   only now should it say “Hello, Hack Atlantic!” and “Published to local
-   phone-demo branch.”
+Start and leave open these four things:
 
-The MVP has no task-confirmation step. New requests
-and follow-up questions start directly; greetings and standalone “yes” replies
-do not become tasks or authorize a push. PIN authentication proves who is
-calling; it is not blanket permission for every protected action. The decision
-applies only to the exact currently held action. An optional task
-read-back mode is deferred until after the MVP/demo.
+1. The preview created with `headline-demo.mjs --serve`.
+2. The voice webhook:
 
-If you need to leave, hang up after the task starts. A pending protected action
-still triggers one callback. Because that is a **different call**, authenticate
-again (spoken or keypad PIN), then listen and press **1** or **2**; **3** requests
-the details. The watcher verifies this callback path too. No answer, failed PIN
-or expired approval leaves the action blocked. Hanging up after a same-call
-decision does not trigger another approval callback.
+   ```powershell
+   node --env-file=apps/voice-webhook/.env apps/voice-webhook/src/server.mjs
+   ```
 
-Say PIN digits in English, including leading zeros, with no extra sentence.
-Both input methods share the existing three-attempt lockout. Spoken PINs are
-processed by Twilio's speech-recognition service, not sent to Codex; the app
-does not echo or persist the raw PIN. Keypad input remains available when
-speaking a PIN aloud is inappropriate. See [Twilio Gather](https://www.twilio.com/docs/voice/twiml/gather).
+3. The paired daemon:
 
-After installing a voice-server code change, hang up and restart that server
-with its normal command; it does not reload source files automatically. Keep
-the daemon, ngrok and preview running. Restart the watcher before retrying if
-it has timed out.
+   ```powershell
+   node --env-file=apps/daemon/.env apps/daemon/src/server.mjs
+   ```
 
-If the watcher fails, the callback does not arrive, or the preview reports a
-changed fixture, stop and inspect the state. Do not approve blindly or retry
-against the same branch. A fresh demo run needs a fresh fixture because the
-`phone-demo` destination must initially be absent.
+4. ngrok forwarding port 3000, plus this watcher in another terminal:
 
-Current evidence: both the earlier callback-approved push and the later
-same-call approved push have completed real-runtime records and matching
-local refs. The latter decision was recorded at 05:47 UTC on 27 September,
-on the original authenticated call, with no callback attempt. The caller
-confirmed using a spoken PIN. These are saved-state checks plus the caller's
-report, not a claim that this agent heard the call or observed a live watcher
-PASS. The newly shortened narration still needs a fresh phone rehearsal.
-An empty-ref preflight cannot pass on a published fixture; create a fresh one.
+   ```powershell
+   node --env-file=apps/voice-webhook/.env --env-file=apps/daemon/.env apps/daemon/scripts/observe-phone-approval.mjs --watch
+   ```
 
-The short local-push description is a fixed template, enabled only by the
-daemon after its local destination and source checks. It is bound into the
-same action digest and persisted in the existing approval audit. Unknown or
-older actions, or requests with extra permission grants, retain the full
-command/permission disclosure instead of receiving a guessed summary. Fake
-mode explicitly says no files will change. Approval, expiry, rejection and
-Git verification rules are unchanged. The brief success sentence is emitted
-only after the daemon checks the destination ref, not merely a model's claim.
+Then call from the allowlisted phone, enter or say the PIN, and say exactly:
+**“Run the demo push.”** **“Push the demo repo”** is an equivalent supported
+phrase. Wait until Dylamo confirms the task started, then hang up. Answer the
+callback, authenticate again, and say **“approve”** or **“push the demo repo”**
+to approve once. Say **“reject”** to decline or **“details”** to hear the exact
+command. Keypad **1**, **2**, and **3** remain optional fallbacks.
 
-Tell judges plainly: the headline change was prepared in advance; Dylamo's
-live contribution is running the Codex task independently of the phone call
-and requiring exact, one-use phone approval before the local release. The
-caller can stay on the line or leave and receive a callback. A real
-agent-authored change remains a separate, unverified stretch goal.
+Treat the demo as successful only when the watcher reports a final `PASS` and
+the preview turns green. If the watcher has not first shown the held action,
+do not approve.
+
+## Reset for another trial
+
+A successful fixture cannot be reused because its `phone-demo` branch is no
+longer empty. Press Ctrl+C only in the old preview terminal, run
+`headline-demo.mjs --serve` again, replace the two printed daemon fixture paths,
+restart the daemon, and repeat the two preflight checks. Leave old temporary
+fixtures alone for inspection; never reset or clean the Dylamo repository.
+
+## Optional same-call variation
+
+Stay on the original authenticated call instead of hanging up. Once the held
+action is announced, say **“approve”** or press **1**. This skips the callback;
+the one-use decision is still tied to that exact action. The callback-first flow
+is the stronger presentation because it visibly demonstrates work continuing
+without the caller.
+
+## Timing and honest limits
+
+Allow 3–5 minutes for local setup, up to 2 minutes for the reject rehearsal,
+and 5–10 minutes for a first live callback trial. Carrier, tunnel, and Codex
+latency mean it is not guaranteed to complete inside one minute. For judges,
+start the task shortly before presenting and keep a clearly labeled fallback
+ready. The live contribution is protected continuation and approval—not an
+autonomous code change or a GitHub deployment.

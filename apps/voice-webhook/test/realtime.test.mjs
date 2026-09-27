@@ -70,6 +70,7 @@ test('controlled Realtime transcribes without auto-reply and speaks only server 
     assert.deepEqual(upstream.sent[0].session.audio.input.transcription.languages, ['en']);
     assert.equal(upstream.sent[0].session.audio.input.transcription.language, undefined);
     assert.ok(upstream.sent[0].session.audio.input.transcription.keywords.includes('Run the demo push'));
+    assert.ok(upstream.sent[0].session.audio.input.transcription.keywords.includes('Push the demo repo'));
     assert.match(upstream.sent[0].session.audio.input.transcription.prompt, /English.*Dylamo.*Codex/);
     assert.equal(upstream.sent[0].session.audio.input.turn_detection.create_response, false);
     upstream.receive({ type: 'session.updated' });

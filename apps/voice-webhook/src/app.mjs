@@ -31,6 +31,15 @@ const CANCEL_CONFIRMATIONS = new Set(['yes stop it', 'yes cancel it']);
 const CANCEL_REJECTIONS = new Set(['no', 'no keep working']);
 const ACTION_APPROVE = new Set(['approve', 'approve it', 'yes approve', 'yes approve it']);
 const ACTION_REJECT = new Set(['reject', 'reject it', 'no reject', 'no reject it']);
+const CALLBACK_APPROVE = new Set([...ACTION_APPROVE, 'approve once', 'push the demo repo', 'push the demo repository']);
+const CALLBACK_REJECT = new Set([...ACTION_REJECT, 'decline', 'decline it']);
+const CALLBACK_DETAILS = new Set(['details', 'show details', 'more details', 'exact command', 'what is the command']);
+const SITE_MONITOR_ID = 'local-checkout';
+const SITE_MONITOR_CONDITIONS = new Set(['slow_response', 'http_errors']);
+const SITE_MONITOR_YES = new Set(['yes', 'yes please', 'send it', 'send the report', 'send report']);
+const SITE_MONITOR_NO = new Set(['no', 'no thanks', 'do not send', "don't send", 'do not send it']);
+const INTERNAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SYNTHETIC_INCIDENT_ID = /^synthetic-checkout-[1-9]\d*$/;
 // These are adapter-owned milestones, not model text or tool output.
 const SPOKEN_CODEX_PROGRESS = new Set([
   'Codex is checking a repository command.',
@@ -57,6 +66,62 @@ function xmlEscape(value) {
 function sameToken(expected, received) {
   if (typeof received !== 'string' || received.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(expected), Buffer.from(received));
+}
+
+// This remains deliberately narrow even when a future protocol schema also
+// validates it. A monitor daemon may describe only the known local demo site
+// and fixed conditions; it cannot choose a phone number, URL, or spoken text.
+function parseSiteMonitorEvent(event, machineId) {
+  if (!event || typeof event !== 'object' || Array.isArray(event) || event.v !== PROTOCOL_VERSION ||
+      typeof event.eventId !== 'string' || !INTERNAL_ID.test(event.eventId) || event.machineId !== machineId || event.monitorId !== SITE_MONITOR_ID ||
+      typeof event.incidentId !== 'string' || !SYNTHETIC_INCIDENT_ID.test(event.incidentId) ||
+      typeof event.observedAt !== 'string' || !Number.isFinite(Date.parse(event.observedAt))) return null;
+  if (event.type === 'site_monitor.incident' && SITE_MONITOR_CONDITIONS.has(event.condition)) {
+    return { type: event.type, eventId: event.eventId, machineId, monitorId: event.monitorId,
+      incidentId: event.incidentId, condition: event.condition, observedAt: Date.parse(event.observedAt) };
+  }
+  if (event.type === 'site_monitor.recovered') {
+    return { type: event.type, eventId: event.eventId, machineId, monitorId: event.monitorId,
+      incidentId: event.incidentId, observedAt: Date.parse(event.observedAt) };
+  }
+  return null;
+}
+
+function monitorChoice(params) {
+  if (params.Digits === '1') return 'requested';
+  if (params.Digits === '2') return 'declined';
+  const speech = typeof params.SpeechResult === 'string'
+    ? params.SpeechResult.trim().toLowerCase().replace(/[.!?]+$/g, '').replace(/\s+/g, ' ')
+    : '';
+  if (SITE_MONITOR_YES.has(speech)) return 'requested';
+  if (SITE_MONITOR_NO.has(speech)) return 'declined';
+  return null;
+}
+
+// Callback consent remains deliberately narrower than general conversation.
+// The caller has already been authenticated with the callback PIN, and these
+// exact phrases resolve only the one persisted approval bound to that call.
+// A bare "yes", qualified approval, or any other transcript fails closed.
+function approvalChoice(params) {
+  // Twilio sends exactly one result type for a Gather. Treat any request that
+  // carries both fields as ambiguous, even when one field is empty. This keeps
+  // a forged mixed-mode request from falling through to the other modality.
+  const hasDigits = Object.hasOwn(params, 'Digits');
+  const hasSpeech = Object.hasOwn(params, 'SpeechResult');
+  if (hasDigits && hasSpeech) return null;
+  const digitsPresent = typeof params.Digits === 'string' && params.Digits.length > 0;
+  const speechPresent = typeof params.SpeechResult === 'string' && params.SpeechResult.trim().length > 0;
+  if (digitsPresent) {
+    if (params.Digits === '1') return 'approve';
+    if (params.Digits === '2') return 'reject';
+    if (params.Digits === '3') return 'details';
+    return null;
+  }
+  const speech = speechPresent ? localChoice(params.SpeechResult) : '';
+  if (CALLBACK_APPROVE.has(speech)) return 'approve';
+  if (CALLBACK_REJECT.has(speech)) return 'reject';
+  if (CALLBACK_DETAILS.has(speech)) return 'details';
+  return null;
 }
 
 function ulawSample(sample) {
@@ -102,7 +167,7 @@ async function readBody(request) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-export function createServer({ authToken, accountSid, publicBaseUrl, allowedCallerNumber, callbackCallerNumber, pinHash, voiceMode = 'tone', agentMode = 'voice', openAiApiKey, codexApprovalEnabled = false, realtimeConnector = connectRealtime, callbackCreator = createTwilioCallback, daemonCredentials = new Map(), onDaemonEvent, onDaemonStatus, stateStore, now = Date.now, statusTiming = { firstMs: FIRST_STATUS_MS, repeatMs: REPEAT_STATUS_MS }, steerAckMs = STEER_ACK_MS }) {
+export function createServer({ authToken, accountSid, publicBaseUrl, allowedCallerNumber, callbackCallerNumber, pinHash, voiceMode = 'tone', agentMode = 'voice', openAiApiKey, codexApprovalEnabled = false, siteMonitorDemoEnabled = false, siteMonitorMachineId = null, realtimeConnector = connectRealtime, callbackCreator = createTwilioCallback, daemonCredentials = new Map(), onDaemonEvent, onDaemonStatus, stateStore, now = Date.now, statusTiming = { firstMs: FIRST_STATUS_MS, repeatMs: REPEAT_STATUS_MS }, steerAckMs = STEER_ACK_MS }) {
   if (!authToken || !accountSid || !publicBaseUrl || !allowedCallerNumber || !pinHash) {
     throw new Error('TWILIO_AUTH_TOKEN, TWILIO_ACCOUNT_SID, PUBLIC_BASE_URL, ALLOWED_CALLER_NUMBER, and DEMO_PIN_HASH are required');
   }
@@ -124,7 +189,13 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
   }
   if (voiceMode === 'realtime' && !openAiApiKey) throw new Error('OPENAI_API_KEY is required when VOICE_MODE=realtime');
   if (codexApprovalEnabled && (agentMode !== 'codex' || !callbackCallerNumber)) throw new Error('Codex approvals require codex mode and TWILIO_PHONE_NUMBER');
+  if (typeof siteMonitorDemoEnabled !== 'boolean') throw new Error('SITE_MONITOR_DEMO_ENABLED must be a boolean');
+  if (siteMonitorDemoEnabled && (!stateStore || !callbackCallerNumber || !INTERNAL_ID.test(siteMonitorMachineId ?? '') ||
+      !daemonCredentials.has(siteMonitorMachineId))) {
+    throw new Error('Site monitor demo requires durable state, TWILIO_PHONE_NUMBER, and one paired SITE_MONITOR_MACHINE_ID');
+  }
   const callbacksEnabled = Boolean(callbackCallerNumber && (agentMode === 'fake' || codexApprovalEnabled));
+  const siteMonitorCallbacksEnabled = Boolean(siteMonitorDemoEnabled && callbackCallerNumber);
 
   const user = stateStore?.ensureUser({ phoneNumber: allowedCallerNumber, pinHash });
   if (user) {
@@ -308,6 +379,57 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     }
   }
 
+  function siteMonitorAction(pathname, incidentId, nonce) {
+    return `${base.origin}${pathname}?incidentId=${encodeURIComponent(incidentId)}&nonce=${encodeURIComponent(nonce)}`;
+  }
+
+  function siteMonitorBrief(incident) {
+    const condition = incident.condition === 'slow_response'
+      ? 'The local demo checkout is responding too slowly.'
+      : 'The local demo checkout is returning errors.';
+    // Keep the first notification comfortably close to ten seconds: callers
+    // can request the dashboard report, but do not need a long narration to
+    // learn the condition and choose what happens next.
+    return `Dylamo alert. ${condition} Want a text report? Say yes or press 1. Otherwise say no or press 2.`;
+  }
+
+  function siteMonitorChoiceGather(incident) {
+    const action = siteMonitorAction('/site-monitor/decision', incident.id, incident.callback_nonce);
+    return twiml(`<Gather input="dtmf speech" numDigits="1" timeout="8" speechTimeout="2" language="en-US" action="${xmlEscape(action)}" method="POST" actionOnEmptyResult="true"><Say>${xmlEscape(siteMonitorBrief(incident))}</Say></Gather><Hangup/>`);
+  }
+
+  async function initiateSiteMonitorCallback(incidentId) {
+    if (!siteMonitorCallbacksEnabled) return;
+    const incident = stateStore.getSiteMonitorIncident(incidentId);
+    if (!incident || incident.state !== 'active' || incident.callback_state !== 'planned' || incident.callback_call_sid) return;
+    const url = siteMonitorAction('/site-monitor/voice', incident.id, incident.callback_nonce);
+    const statusUrl = siteMonitorAction('/site-monitor/status', incident.id, incident.callback_nonce);
+    try {
+      const callSid = await callbackCreator({ accountSid, authToken, from: callbackCallerNumber, to: allowedCallerNumber, url, statusUrl });
+      if (stateStore.markSiteMonitorCallbackDialed(incident.id, callSid)) {
+        console.log(`Site monitor callback initiated for incident ${incident.id}`);
+      }
+    } catch (error) {
+      stateStore.markSiteMonitorCallbackFailed(incident.id);
+      console.error(`Site monitor callback failed: ${error.message}`);
+    }
+  }
+
+  function routeSiteMonitorEvent(event) {
+    if (!siteMonitorDemoEnabled) return false;
+    const monitorEvent = parseSiteMonitorEvent(event, siteMonitorMachineId);
+    if (!monitorEvent) return false;
+    let result;
+    const applied = stateStore.applyEventOnce(monitorEvent, () => {
+      result = monitorEvent.type === 'site_monitor.incident'
+        ? stateStore.createSiteMonitorIncident(monitorEvent, { inTransaction: true })
+        : { recovered: stateStore.resolveSiteMonitorIncident(monitorEvent, { inTransaction: true }) };
+    });
+    if (!applied) return true;
+    if (result?.created) void initiateSiteMonitorCallback(result.incident.id);
+    return true;
+  }
+
   function sendApprovalDecision(context) {
     return daemonGateway.sendToMachine(context.machine_id, {
       v: PROTOCOL_VERSION, eventId: randomUUID(), machineId: context.machine_id,
@@ -358,6 +480,10 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
   const daemonGateway = createDaemonGateway({
     credentials: daemonCredentials,
     onEvent: (event) => {
+      if (routeSiteMonitorEvent(event)) {
+        onDaemonEvent?.(event);
+        return;
+      }
       if (stateStore) {
         if (event.type === 'machine.reconcile') {
           let interrupted = [];
@@ -671,7 +797,7 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
   function approvalChoiceGather(approvalId, nonce, context, details = false) {
     const action = approvalAction('/approval/decision', approvalId, nonce);
     const description = approvalPrompt(context, { mode: agentMode, channel: 'callback', details });
-    return twiml(`<Gather input="dtmf" numDigits="1" timeout="8" action="${xmlEscape(action)}" method="POST" actionOnEmptyResult="true"><Say>${xmlEscape(description)}</Say></Gather><Hangup/>`);
+    return twiml(`<Gather input="dtmf speech" numDigits="1" timeout="8" speechTimeout="2" language="en-US" action="${xmlEscape(action)}" method="POST" actionOnEmptyResult="true"><Say>${xmlEscape(description)}</Say></Gather><Hangup/>`);
   }
 
   const server = http.createServer(async (request, response) => {
@@ -680,7 +806,8 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     if (request.method === 'GET' && path.pathname === '/health') {
       return send(response, 200, 'ok');
     }
-    if (!['/voice', '/voice/pin', '/approval/voice', '/approval/pin', '/approval/decision', '/approval/result', '/approval/status'].includes(path.pathname) || request.method !== 'POST') {
+    if (!['/voice', '/voice/pin', '/approval/voice', '/approval/pin', '/approval/decision', '/approval/result', '/approval/status',
+      '/site-monitor/voice', '/site-monitor/decision', '/site-monitor/status'].includes(path.pathname) || request.method !== 'POST') {
       return send(response, 404, 'not found');
     }
     if (!request.headers['content-type']?.toLowerCase().startsWith('application/x-www-form-urlencoded')) {
@@ -707,6 +834,46 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     prune();
     const from = params.From;
     const callSid = params.CallSid;
+    if (path.pathname.startsWith('/site-monitor/')) {
+      // A monitor callback is a notification, not an approval. It may only
+      // reach the configured caller from the configured Twilio number and
+      // cannot use daemon-provided prose, destinations, or commands.
+      if (!siteMonitorCallbacksEnabled || params.To !== allowedCallerNumber || from !== callbackCallerNumber ||
+          params.Direction !== 'outbound-api' || !/^CA[0-9a-fA-F]{32}$/.test(callSid ?? '')) {
+        return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
+      }
+      const incidentId = path.searchParams.get('incidentId');
+      const nonce = path.searchParams.get('nonce');
+      const incident = stateStore.getSiteMonitorIncident(incidentId);
+      if (path.pathname === '/site-monitor/status') {
+        if (!incident || incident.callback_nonce !== nonce ||
+            (incident.callback_call_sid && incident.callback_call_sid !== callSid)) return send(response, 403, 'forbidden');
+        stateStore.recordSiteMonitorCallbackEnd({ incidentId, nonce, callSid, status: params.CallStatus });
+        return send(response, 204, '');
+      }
+      if (!incident || incident.callback_nonce !== nonce || incident.state !== 'active' ||
+          incident.callback_completed_at != null) {
+        return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
+      }
+      if (path.pathname === '/site-monitor/voice') {
+        if (!stateStore.bindSiteMonitorCallback(incidentId, nonce, callSid)) return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
+        return send(response, 200, siteMonitorChoiceGather(stateStore.getSiteMonitorIncident(incidentId)), 'text/xml; charset=utf-8');
+      }
+      if (incident.callback_call_sid !== callSid || incident.callback_state !== 'dialed') {
+        return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
+      }
+      const reportDecision = monitorChoice(params);
+      if (!reportDecision) {
+        return send(response, 200, siteMonitorChoiceGather(incident), 'text/xml; charset=utf-8');
+      }
+      if (!stateStore.finishSiteMonitorCallback({ incidentId, callSid, reportDecision })) {
+        return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
+      }
+      const result = reportDecision === 'requested'
+        ? 'Text reports are not enabled in this demo. No text was sent.'
+        : 'Okay. No text will be sent.';
+      return send(response, 200, twiml(`<Say>${xmlEscape(result)}</Say><Hangup/>`), 'text/xml; charset=utf-8');
+    }
     if (path.pathname.startsWith('/approval/')) {
       if (!callbacksEnabled || params.To !== allowedCallerNumber || from !== callbackCallerNumber ||
           params.Direction !== 'outbound-api' || !/^CA[0-9a-fA-F]{32}$/.test(callSid ?? '')) {
@@ -756,9 +923,10 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
         return send(response, 200, approvalChoiceGather(approvalId, nonce, context), 'text/xml; charset=utf-8');
       }
       if (!callback.pin_verified) return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
-      if (!['1', '2'].includes(params.Digits)) return send(response, 200,
-        approvalChoiceGather(approvalId, nonce, context, params.Digits === '3'), 'text/xml; charset=utf-8');
-      const approved = params.Digits === '1';
+      const choice = approvalChoice(params);
+      if (!choice || choice === 'details') return send(response, 200,
+        approvalChoiceGather(approvalId, nonce, context, choice === 'details'), 'text/xml; charset=utf-8');
+      const approved = choice === 'approve';
       stateStore.decideApproval({ approvalId, runId: context.run_id, actionDigest: context.action_digest, userId: context.user_id, approved });
       const decision = stateStore.getApprovalContext(approvalId);
       stateStore.finishApprovalCallback(approvalId, callSid);
@@ -988,6 +1156,10 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
   });
 
   server.daemonGateway = daemonGateway;
+  // The WebSocket gateway calls this internally. Exposing the narrow router
+  // also lets integration tests exercise monitor-event persistence without
+  // weakening the public HTTP surface.
+  server.routeSiteMonitorEvent = routeSiteMonitorEvent;
   server.on('close', () => daemonGateway.close());
 
   return server;

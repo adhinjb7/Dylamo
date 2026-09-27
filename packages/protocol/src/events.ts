@@ -20,6 +20,26 @@ const ApprovalRuntime = z.strictObject({
   itemId: z.string().min(1).max(200), requestId: z.string().min(1).max(200),
 });
 
+// These deliberately narrow events are for the local, synthetic checkout
+// monitor used in the demo. They are not generic external monitoring payloads:
+// a daemon cannot choose caller-facing prose, a URL or a destination.
+const SyntheticMonitorIncident = z.strictObject({
+  ...common,
+  type: z.literal('site_monitor.incident'),
+  monitorId: z.literal('local-checkout'),
+  condition: z.enum(['slow_response', 'http_errors']),
+  incidentId: z.string().regex(/^synthetic-checkout-[1-9]\d*$/).max(100),
+  observedAt: z.iso.datetime(),
+});
+
+const SyntheticMonitorRecovery = z.strictObject({
+  ...common,
+  type: z.literal('site_monitor.recovered'),
+  monitorId: z.literal('local-checkout'),
+  incidentId: z.string().regex(/^synthetic-checkout-[1-9]\d*$/).max(100),
+  observedAt: z.iso.datetime(),
+});
+
 export const AgentStatus = z.enum(['available', 'idle', 'working', 'offline']);
 
 export const RegisteredAgent = z.strictObject({
@@ -34,6 +54,8 @@ export const DaemonEvent = z.discriminatedUnion('type', [
   z.strictObject({ ...common, type: z.literal('machine.register'), name: z.string().min(1).max(100), agents: z.array(RegisteredAgent).max(32) }),
   z.strictObject({ ...common, type: z.literal('machine.heartbeat'), sentAt: z.iso.datetime() }),
   z.strictObject({ ...common, type: z.literal('machine.reconcile'), activeRunIds: z.array(InternalId).max(1000) }),
+  SyntheticMonitorIncident,
+  SyntheticMonitorRecovery,
   z.strictObject({ ...common, ...run, type: z.literal('agent.started'), codexThreadId: z.string().min(1).max(200), codexTurnId: z.string().min(1).max(200) }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.progress'), text: z.string().min(1).max(2000) }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.message'), text: z.string().min(1).max(4000) }),

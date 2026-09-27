@@ -8,4 +8,6 @@ dist/
 data/
 work/
 .dylamo-tmp/
+.codex-build/
+.codex-finalizer/
 Hack_Atlantic_Agent_Telephony_Codex_Brief_Revised.docx

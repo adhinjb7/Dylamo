@@ -22,6 +22,8 @@ const server = createServer({
   agentMode: process.env.AGENT_MODE ?? (process.env.VOICE_MODE === 'realtime' && process.env.DAEMON_CREDENTIALS ? 'fake' : 'voice'),
   openAiApiKey: process.env.OPENAI_API_KEY,
   codexApprovalEnabled: process.env.CODEX_APPROVAL_ENABLED === 'true',
+  siteMonitorDemoEnabled: process.env.SITE_MONITOR_DEMO_ENABLED === 'true',
+  siteMonitorMachineId: process.env.SITE_MONITOR_MACHINE_ID ?? null,
   daemonCredentials: parseDaemonCredentials(process.env.DAEMON_CREDENTIALS),
   onDaemonStatus: (machineId, status) => console.log(`Machine ${machineId}: ${status}`),
   stateStore: store,

@@ -23,6 +23,8 @@ test('headline demo has an unpublished old page and a clean prepared commit', ()
   assert.equal(before.commit, fixture.baselineCommit);
   assert.match(before.html, /<h1>Dylamo demo site<\/h1>/);
   assert.doesNotMatch(before.html, /Hello, Hack Atlantic!/);
+  assert.match(before.html, /<body class="awaiting-approval">/);
+  assert.match(before.html, /linear-gradient\(145deg, #0a1220 0%, #142a4d 100%\)/);
   assert.match(before.html, /Before local approval/);
   assert.equal(fixture.remoteCommit(), '');
   const prepared = fixture.git(fixture.workspace, ['show', 'HEAD:site/index.html']);
@@ -41,6 +43,8 @@ test('only the local protected push makes the new headline visible', () => withF
   assert.equal(after.published, true);
   assert.equal(after.commit, fixture.preparedCommit);
   assert.match(after.html, /<h1>Hello, Hack Atlantic!<\/h1>/);
+  assert.match(after.html, /<body class="published">/);
+  assert.match(after.html, /linear-gradient\(145deg, #063f31 0%, #08714e 100%\)/);
   assert.match(after.html, /Published to local phone-demo branch/);
 }));
 
