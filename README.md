@@ -1,84 +1,51 @@
 # Dylamo
 
-Dylamo is a self-hosted, phone-native control plane for local AI agents. A
-caller can start a task, let it continue after hanging up, receive a short
-alert when a protected action needs attention, and make one exact approval by
-phone.
+Dylamo is a self-hosted phone interface for local AI agents. An authenticated caller can start a task, hang up, and approve one exact action by phone when needed. The paired machine remains in control.
 
-The agent runs on the paired local machine. The phone is the remote interface,
-not a replacement for local control.
+## MVP
 
-## What the MVP demonstrates
+- Allowlisted caller authentication by spoken or keypad PIN.
+- A local Codex task that continues after the caller hangs up.
+- One-use approval for one configured local Git push to a disposable bare repository; never GitHub.
+- A synthetic local checkout monitor that places one phone alert. It runs no Codex task and sends no SMS.
 
-- Caller authentication with an allowlisted phone number and a spoken or
-  spoken or keypad PIN.
-- A local Codex task that can keep running after the caller hangs up.
-- One-use human approval before one configured **local** Git push. The demo
-  pushes only to a disposable local bare repository, never to GitHub.
-- A separate, synthetic site-monitor alert: a local simulated checkout issue
-  triggers one short phone notification. It does not run a Codex task or send
-  SMS.
-
-## Quick local check
+## Local setup
 
 Requires Node.js 22.13 or newer.
 
-From the repository root:
-
-```powershell
+~~~sh
 npm install
 npm run build:protocol
 npm test
-```
+~~~
 
-Private configuration belongs only in the ignored `.env` files. Start from
-`apps/voice-webhook/.env.example` and `apps/daemon/.env.example`; never commit
-phone numbers, PINs, API keys, daemon tokens, or tunnel URLs.
+Create ignored .env files from **apps/voice-webhook/.env.example** and **apps/daemon/.env.example**. Never commit phone numbers, PINs, keys, tokens, or tunnel URLs.
 
-## Run the two demos
+## Demos
 
-1. **Protected local release:** [protected-release runbook](docs/headline-demo.md)
-   shows a prepared visual change, a real phone callback, one-use approval,
-   and a visible local release.
-2. **Synthetic monitor alert:** [monitor runbook](docs/site-monitor-demo.md)
-   safely simulates a local checkout failure, places a short alert call, and
-   demonstrates the “no SMS sent” response.
+1. [Protected local release](docs/headline-demo.md): a prepared visual change, callback, and one-use approval.
+2. [Synthetic monitor alert](docs/site-monitor-demo.md): a safe local outage simulation and phone notification.
 
-For a first rehearsal, use the protected-release runbook's local checks and
-reject rehearsal before placing a real phone call.
+Run the protected-release preflight and rejection rehearsal before a live call.
 
-## Project layout
+## Layout
 
-- `apps/voice-webhook/` — Twilio voice webhook, caller authentication, durable
-  call/task/approval state, and callback logic.
-- `apps/daemon/` — paired local daemon, Codex adapter, approval boundary, and
-  synthetic monitor demo.
-- `packages/protocol/` — validated messages exchanged by the webhook and
-  daemon.
-- `docs/` — concise runbooks, architecture, teammate handoffs, and poster
-  asset provenance.
+- **apps/voice-webhook/**: Twilio webhook, authentication, SQLite state, and callbacks.
+- **apps/daemon/**: paired local daemon, Codex adapter, approval boundary, and monitor.
+- **packages/protocol/**: validated webhook and daemon messages.
+- **docs/**: runbooks, architecture, handoffs, and poster provenance.
 
-## Important MVP boundaries
+## Boundaries
 
-- The default Codex profile is read-only. Workspace-writing is opt-in and
-  should use a disposable, non-sensitive repository.
-- A PIN authenticates a caller; it does not grant blanket approval. Each
-  protected action is bound to one pending action and expires.
-- The synthetic monitor is local and deliberately narrow. It is not a claim of
-  production monitoring, clinical workflow, classified-data handling, or
-  operational command authority.
-- A successful phone call is evidence of the live demo, but it is not a
-  deployment to GitHub or a public website.
+- Codex is read-only by default. Use writes only in a disposable, non-sensitive repository.
+- A PIN authenticates the caller; each approval applies to one pending action and expires.
+- The local monitor is a demo, not production monitoring or operational authority.
+- A successful call validates the demo; it does not deploy to GitHub or a public site.
 
-## Documentation map
+## Documentation
 
-- [Architecture](docs/architecture.md) — components, data boundaries, and
-  safety model.
-- [Protected local-release runbook](docs/headline-demo.md) — the primary
-  callback-first demo and reset instructions.
-- [Synthetic monitor demo](docs/site-monitor-demo.md) — the secondary phone
-  alert demo.
-- [Team handoffs](docs/team/README.md) — isolated work specifications for
-  active teammates.
-- [Poster mockup provenance](docs/poster/daemon-dashboard-mockup-prompt.md) —
-  explains that the dashboard image is a concept, not a product screenshot.
+- [Architecture](docs/architecture.md)
+- [Protected local-release runbook](docs/headline-demo.md)
+- [Synthetic monitor demo](docs/site-monitor-demo.md)
+- [Team handoffs](docs/team/README.md)
+- [Poster mockup provenance](docs/poster/daemon-dashboard-mockup-prompt.md)
