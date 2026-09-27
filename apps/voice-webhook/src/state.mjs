@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS call_attempts (
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), prompt TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('queued','running','waiting_human','completed','failed','cancelled')),
-  started_at INTEGER NOT NULL, finished_at INTEGER
+  started_at INTEGER NOT NULL, finished_at INTEGER, result_text TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS agent_runs (
   id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), agent_id TEXT NOT NULL,
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES agent_runs(id),
   action_digest TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL,
-  codex_item_id TEXT, codex_request_id TEXT,
+  codex_item_id TEXT, codex_request_id TEXT, permission_scope TEXT,
   state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','expired')),
   expires_at INTEGER NOT NULL, resolved_at INTEGER, decided_by_user_id TEXT REFERENCES users(id)
 ) STRICT;
@@ -84,12 +84,16 @@ export function openStateStore(path, { now = Date.now } = {}) {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
   const version = db.prepare('PRAGMA user_version').get().user_version;
-  if (version > 2) {
+  if (version > 3) {
     db.close();
     throw new Error('database schema is newer than this application');
   }
   db.exec(SCHEMA);
-  if (version < 2) db.exec('PRAGMA user_version = 2');
+  if (version < 3) {
+    if (!db.prepare('PRAGMA table_info(tasks)').all().some(column => column.name === 'result_text')) db.exec('ALTER TABLE tasks ADD COLUMN result_text TEXT');
+    if (!db.prepare('PRAGMA table_info(approvals)').all().some(column => column.name === 'permission_scope')) db.exec('ALTER TABLE approvals ADD COLUMN permission_scope TEXT');
+    db.exec('PRAGMA user_version = 3');
+  }
 
   function transaction(work) {
     db.exec('BEGIN IMMEDIATE');
@@ -221,13 +225,13 @@ export function openStateStore(path, { now = Date.now } = {}) {
     if (!result.changes) throw new Error('Codex run IDs cannot be assigned');
   }
 
-  function createApproval({ approvalId = randomUUID(), runId, actionDigest, command, cwd, expiresAt, codexItemId = null, codexRequestId = null }) {
+  function createApproval({ approvalId = randomUUID(), runId, actionDigest, command, cwd, expiresAt, codexItemId = null, codexRequestId = null, permissionScope = null }) {
     if (!/^[a-f0-9]{64}$/.test(actionDigest) || !Number.isInteger(expiresAt) || expiresAt <= now()) {
       throw new Error('invalid approval action or expiry');
     }
-    db.prepare(`INSERT INTO approvals (id, run_id, action_digest, command, cwd, codex_item_id, codex_request_id, state, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
-      .run(approvalId, runId, actionDigest, command, cwd, codexItemId, codexRequestId, expiresAt);
+    db.prepare(`INSERT INTO approvals (id, run_id, action_digest, command, cwd, codex_item_id, codex_request_id, permission_scope, state, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+      .run(approvalId, runId, actionDigest, command, cwd, codexItemId, codexRequestId, permissionScope, expiresAt);
     return approvalId;
   }
 
@@ -240,10 +244,14 @@ export function openStateStore(path, { now = Date.now } = {}) {
 
   function markApprovalCallbackDialed(approvalId, callSid) {
     if (!/^CA[0-9a-fA-F]{32}$/.test(callSid)) throw new Error('invalid callback call SID');
+    const prior = db.prepare('SELECT call_sid, state FROM approval_callbacks WHERE approval_id=?').get(approvalId);
+    // Twilio may send webhooks before its REST response reaches this server.
+    if (prior?.call_sid === callSid && ['finished', 'failed'].includes(prior.state)) return;
     const result = db.prepare(`UPDATE approval_callbacks SET call_sid=?, state='dialed'
       WHERE approval_id=? AND state IN ('planned','dialed') AND (call_sid IS NULL OR call_sid=?)`)
       .run(callSid, approvalId, callSid);
     if (!result.changes) throw new Error('callback SID mismatch');
+    recordApprovalCall(approvalId, callSid);
   }
 
   function markApprovalCallbackFailed(approvalId) {
@@ -255,7 +263,41 @@ export function openStateStore(path, { now = Date.now } = {}) {
     const result = db.prepare(`UPDATE approval_callbacks SET call_sid=?, state='dialed'
       WHERE approval_id=? AND nonce=? AND state IN ('planned','dialed') AND (call_sid IS NULL OR call_sid=?)`)
       .run(callSid, approvalId, nonce, callSid);
+    if (result.changes) recordApprovalCall(approvalId, callSid);
     return result.changes === 1;
+  }
+
+  function recordApprovalCall(approvalId, callSid) {
+    db.prepare(`INSERT OR IGNORE INTO call_attempts
+      (id, session_id, call_sid, phone_number, direction, state, started_at)
+      SELECT ?, t.session_id, ?, u.phone_number, 'outbound', 'authenticating', ?
+      FROM approvals a JOIN agent_runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
+      JOIN sessions s ON s.id=t.session_id JOIN users u ON u.id=s.user_id WHERE a.id=?`)
+      .run(randomUUID(), callSid, now(), approvalId);
+  }
+
+  function recordApprovalCallEnd({ approvalId, nonce, callSid, status }) {
+    const reasons = { completed: 'callback_completed', busy: 'callback_busy', failed: 'callback_failed',
+      'no-answer': 'callback_no_answer', canceled: 'callback_canceled' };
+    if (!Object.hasOwn(reasons, status) || !/^CA[0-9a-fA-F]{32}$/.test(callSid)) return false;
+    return transaction(() => {
+      const callback = db.prepare('SELECT * FROM approval_callbacks WHERE approval_id=? AND nonce=?').get(approvalId, nonce);
+      if (!callback || (callback.call_sid && callback.call_sid !== callSid)) return false;
+      if (!callback.call_sid) {
+        // A REST timeout can leave the create outcome uncertain. A later signed
+        // terminal webhook supplies its SID without reopening authentication.
+        db.prepare('UPDATE approval_callbacks SET call_sid=? WHERE approval_id=? AND call_sid IS NULL').run(callSid, approvalId);
+        recordApprovalCall(approvalId, callSid);
+      }
+      const call = db.prepare('SELECT * FROM call_attempts WHERE call_sid=?').get(callSid);
+      if (!call || ['ended', 'rejected'].includes(call.state)) return false;
+      setCallState(callSid, 'ended', reasons[status]);
+      // The call ending is never an approval or rejection. A pending action
+      // stays paused until its independent approval timer expires.
+      db.prepare("UPDATE approval_callbacks SET state='failed' WHERE approval_id=? AND state IN ('planned','dialed')").run(approvalId);
+      audit(call.session_id, 'callback.ended', { approvalId, status });
+      return true;
+    });
   }
 
   function verifyApprovalCallbackPin(approvalId, callSid) {
@@ -315,15 +357,40 @@ export function openStateStore(path, { now = Date.now } = {}) {
     return { calls, machines };
   }
 
+  function unfinishedRunsForMachine(machineId) {
+    return db.prepare(`SELECT r.id AS runId, r.task_id AS taskId, t.session_id AS sessionId
+      FROM agent_runs r JOIN tasks t ON t.id=r.task_id JOIN sessions s ON s.id=t.session_id
+      WHERE s.machine_id=? AND r.state IN ('queued','running','waiting_human')`).all(machineId);
+  }
+
+  function reconcileMachineRuns(machineId, activeRunIds, candidates) {
+    const active = new Set(activeRunIds);
+    const prior = new Set(candidates);
+    const interrupted = [];
+    for (const run of unfinishedRunsForMachine(machineId)) {
+      if (active.has(run.runId) || !prior.has(run.runId)) continue;
+      transitionRun(run.runId, 'failed');
+      transitionTask(run.taskId, 'failed');
+      expirePendingApprovalsForRun(run.runId);
+      const reason = 'The daemon no longer owns this task. Its outcome is uncertain; check the repository before retrying.';
+      db.prepare('UPDATE tasks SET result_text=? WHERE id=?').run(reason, run.taskId);
+      audit(run.sessionId, 'task.interrupted', { runId: run.runId, taskId: run.taskId });
+      interrupted.push({ ...run, machineId, type: 'task.failed', reason });
+    }
+    return interrupted;
+  }
+
   return {
     ensureUser, ensureMachine, setMachineStatus, touchMachine,
     startInboundCall, recordRejectedCall, setCallState,
     recordAuthFailure, isAuthLocked, clearAuthFailures,
     assignSessionAgent, createTask, transitionTask, createRun, transitionRun, setCodexRunIds,
     createApproval, decideApproval, expirePendingApprovalsForRun,
-    prepareApprovalCallback, markApprovalCallbackDialed,
+    prepareApprovalCallback, markApprovalCallbackDialed, recordApprovalCallEnd,
     markApprovalCallbackFailed, bindApprovalCallback, verifyApprovalCallbackPin,
     finishApprovalCallback, applyEventOnce, audit, recoverAfterRestart,
+    unfinishedRunsForMachine, reconcileMachineRuns,
+    setTaskResult: (taskId, text) => db.prepare('UPDATE tasks SET result_text=? WHERE id=?').run(text.slice(0, 4000), taskId),
     getCall: (callSid) => db.prepare('SELECT * FROM call_attempts WHERE call_sid=?').get(callSid),
     getMachine: (machineId) => db.prepare('SELECT id, name, connection_status AS status, last_seen_at AS lastSeenAt FROM machines WHERE id=?').get(machineId),
     getTask: (taskId) => db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId),
@@ -332,7 +399,8 @@ export function openStateStore(path, { now = Date.now } = {}) {
     getRun: (runId) => db.prepare('SELECT * FROM agent_runs WHERE id=?').get(runId),
     getRunForTask: (taskId) => db.prepare('SELECT * FROM agent_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1').get(taskId),
     getApproval: (approvalId) => db.prepare('SELECT * FROM approvals WHERE id=?').get(approvalId),
-    hasApprovedApprovalForRun: (runId) => Boolean(db.prepare("SELECT 1 FROM approvals WHERE run_id=? AND state='approved' LIMIT 1").get(runId)),
+    hasApprovedApprovalForRun: (runId) => Boolean(db.prepare(`SELECT 1 FROM approvals WHERE run_id=? AND state='approved'
+      AND NOT EXISTS (SELECT 1 FROM approvals WHERE run_id=? AND state != 'approved') LIMIT 1`).get(runId, runId)),
     getApprovalContext: (approvalId) => db.prepare(`SELECT a.*, r.task_id, t.session_id, s.machine_id, s.user_id
       FROM approvals a JOIN agent_runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
       JOIN sessions s ON s.id=t.session_id WHERE a.id=?`).get(approvalId),
@@ -344,6 +412,11 @@ export function openStateStore(path, { now = Date.now } = {}) {
       r.task_id, t.session_id FROM approvals a JOIN agent_runs r ON r.id=a.run_id
       JOIN tasks t ON t.id=r.task_id JOIN sessions s ON s.id=t.session_id
       WHERE s.machine_id=? AND a.state IN ('approved','rejected') AND r.state='waiting_human'`).all(machineId),
+    getUndialedApprovalsForMachine: (machineId) => db.prepare(`SELECT a.id, a.run_id
+      FROM approvals a JOIN agent_runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
+      JOIN sessions s ON s.id=t.session_id LEFT JOIN approval_callbacks c ON c.approval_id=a.id
+      WHERE s.machine_id=? AND r.state='waiting_human' AND a.state='pending'
+      AND a.expires_at>? AND c.approval_id IS NULL`).all(machineId, now()),
     listAudit: (sessionId) => db.prepare('SELECT type, redacted_payload AS payload FROM audit_events WHERE session_id=? ORDER BY created_at').all(sessionId),
     close: () => db.close(),
   };

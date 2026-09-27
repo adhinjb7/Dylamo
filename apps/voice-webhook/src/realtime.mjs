@@ -4,7 +4,7 @@ const MODEL = 'gpt-realtime-2.1';
 const MAX_PENDING_FRAMES = 200;
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
 
-export function connectRealtime({ twilio, streamSid, apiKey, controlled = false, onTranscript = () => {}, createSocket = (url, options) => new WebSocket(url, options), logger = console }) {
+export function connectRealtime({ twilio, streamSid, apiKey, controlled = false, onTranscript = () => {}, onTranscriptionFailure = () => {}, onSpeechStart = () => {}, onSpeechStop = () => {}, createSocket = (url, options) => new WebSocket(url, options), logger = console }) {
   if (!apiKey) throw new Error('OPENAI_API_KEY is required for realtime voice');
   const upstream = createSocket(`wss://api.openai.com/v1/realtime?model=${MODEL}`, {
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -12,9 +12,15 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
   const pendingFrames = [];
   const pendingSpeech = [];
   const pendingMarks = new Map();
+  const transcribedItems = new Set();
   let ready = false;
   let closed = false;
   let responseActive = false;
+  let callerSpeaking = false;
+  let interruptPending = false;
+  let cancelEventId;
+  const interruptedResponses = new Set();
+  const interruptedItems = new Set();
   let activeResponseId;
   let activeSpeech;
   let speechNumber = 0;
@@ -48,7 +54,7 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
   }
 
   function flushSpeech() {
-    if (!controlled || !ready || closed || responseActive || !pendingSpeech.length) return;
+    if (!controlled || !ready || closed || callerSpeaking || responseActive || pendingMarks.size || !pendingSpeech.length) return;
     activeSpeech = { text: pendingSpeech.shift(), eventId: `speech-${++speechNumber}` };
     // Reserve immediately: response.created arrives asynchronously, and a task
     // result can arrive while its acknowledgment is still being generated.
@@ -80,6 +86,32 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
     if (!mark) return;
     pendingMarks.delete(name);
     if (mark.itemId === currentItem) playedMs = Math.max(playedMs, mark.endMs);
+    flushSpeech();
+  }
+
+  function cancelSpeechResponse() {
+    // A response.create may still be in flight. In that case, wait for its ID
+    // instead of cancelling an unrelated response or creating a second one.
+    if (!controlled || !responseActive || !activeResponseId || interruptedResponses.has(activeResponseId)) return;
+    interruptedResponses.add(activeResponseId);
+    cancelEventId = `cancel-${++speechNumber}`;
+    sendUpstream({ type: 'response.cancel', event_id: cancelEventId, response_id: activeResponseId });
+  }
+
+  function interruptSpeech() {
+    if (controlled) {
+      pendingSpeech.length = 0;
+      interruptPending = responseActive;
+      cancelSpeechResponse();
+    }
+    if (currentItem) interruptedItems.add(currentItem);
+    if (pendingMarks.size) {
+      sendTwilio({ event: 'clear' });
+      if (currentItem) sendUpstream({ type: 'conversation.item.truncate', item_id: currentItem,
+        content_index: contentIndex, audio_end_ms: Math.floor(playedMs) });
+    }
+    pendingMarks.clear();
+    currentItem = undefined;
   }
 
   function close() {
@@ -88,6 +120,7 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
     pendingFrames.length = 0;
     pendingSpeech.length = 0;
     pendingMarks.clear();
+    transcribedItems.clear();
     activeSpeech = undefined;
     activeResponseId = undefined;
     responseActive = false;
@@ -109,7 +142,14 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
         audio: {
           input: {
             format: { type: 'audio/pcmu' },
-            ...(controlled ? { transcription: { model: 'gpt-transcribe' } } : {}),
+            // Context hints for this English-language demo, not forced output
+            // or an action parser. Keep the actual transcript unchanged.
+            ...(controlled ? { transcription: {
+              model: 'gpt-transcribe',
+              languages: ['en'],
+              prompt: 'An English-language phone call with Dylamo, a voice interface for Codex repository tasks.',
+              keywords: ['Dylamo', 'Codex', 'Git', 'README', 'demo repository', 'Run the demo push'],
+            } } : {}),
             turn_detection: controlled
               ? { type: 'semantic_vad', create_response: false, interrupt_response: false }
               : { type: 'semantic_vad' },
@@ -130,6 +170,16 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
       twilio.close(1011, 'voice service error');
       return;
     }
+    if (event.type === 'input_audio_buffer.speech_started') {
+      callerSpeaking = true;
+      interruptSpeech();
+      onSpeechStart();
+    }
+    if (event.type === 'input_audio_buffer.speech_stopped') {
+      callerSpeaking = false;
+      onSpeechStop();
+      flushSpeech();
+    }
     if (event.type === 'session.updated') {
       ready = true;
       for (const payload of pendingFrames) appendAudio(payload);
@@ -138,16 +188,28 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
     } else if (controlled && event.type === 'response.created') {
       responseActive = true;
       activeResponseId = event.response?.id;
+      if (interruptPending) cancelSpeechResponse();
     } else if (controlled && event.type === 'response.done') {
       if (activeResponseId && event.response?.id !== activeResponseId) return;
       activeSpeech = undefined;
       activeResponseId = undefined;
       responseActive = false;
+      interruptPending = false;
       flushSpeech();
     } else if (controlled && event.type === 'conversation.item.input_audio_transcription.completed' && typeof event.transcript === 'string') {
+      // A repeated terminal event is not another utterance or confirmation.
+      if (typeof event.item_id === 'string' && event.item_id) {
+        if (transcribedItems.has(event.item_id)) return;
+        transcribedItems.add(event.item_id);
+      }
       try { onTranscript(event.transcript, event.item_id); }
       catch (error) { logger.error(`Transcript handling failed: ${error.message}`); }
+    } else if (controlled && event.type === 'conversation.item.input_audio_transcription.failed') {
+      // No transcript means no task. Keep upstream details out of spoken text.
+      onTranscriptionFailure();
+      speak('I could not transcribe that. Please repeat your request.');
     } else if (event.type === 'response.output_audio.delta' && typeof event.delta === 'string') {
+      if ((controlled && interruptPending) || interruptedResponses.has(event.response_id) || interruptedItems.has(event.item_id)) return;
       if (event.item_id !== currentItem) {
         currentItem = event.item_id;
         emittedMs = 0;
@@ -162,19 +224,10 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
       if (sendTwilio({ event: 'mark', mark: { name } })) {
         pendingMarks.set(name, { itemId: currentItem, endMs: Math.floor(emittedMs) });
       }
-    } else if (!controlled && event.type === 'input_audio_buffer.speech_started' && pendingMarks.size) {
-      sendTwilio({ event: 'clear' });
-      pendingMarks.clear();
-      if (currentItem) {
-        sendUpstream({
-          type: 'conversation.item.truncate',
-          item_id: currentItem,
-          content_index: contentIndex,
-          audio_end_ms: Math.floor(playedMs),
-        });
-      }
-      currentItem = undefined;
     } else if (event.type === 'error') {
+      // Generation may have finished just before our cancellation arrived.
+      // Its response.done still controls queue advancement; keep the call up.
+      if (event.error?.code === 'response_cancel_not_active' && cancelEventId && event.error.event_id === cancelEventId) return;
       logger.error(`Realtime error: ${event.error?.code ?? event.error?.type ?? 'unknown'}`);
       if (controlled && event.error?.code === 'conversation_already_has_active_response') {
         // Recover a rejected response.create without terminating the phone call.

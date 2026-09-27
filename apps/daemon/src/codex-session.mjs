@@ -10,7 +10,8 @@ export const CODEX_INITIALIZE_PARAMS = {
 export const CODEX_ACCOUNT_PARAMS = { refreshToken: false };
 
 // Let commands run within the read-only sandbox. The adapter still declines
-// every approval request; this does not grant writes, network, or escalation.
+// approvals unless the opt-in exact-action phone bridge is enabled. This policy
+// alone does not grant writes, network, or escalation.
 const CODEX_APPROVAL_POLICY = 'on-request';
 
 export function codexAccountFailure(result) {
@@ -76,6 +77,7 @@ export function hasExpectedCodexPermissions(result, options) {
 export function createCodexTurnOptions(options, threadId, prompt) {
   return { threadId, cwd: options.cwd, model: options.model, effort: 'medium',
     approvalPolicy: options.approvalPolicy, permissions: options.permissions,
+    ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
     input: [{ type: 'text', text: prompt }] };
 }
 

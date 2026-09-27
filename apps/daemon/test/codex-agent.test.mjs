@@ -3,12 +3,14 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { createCodexAgent, CODEX_AGENT_ID } from '../src/codex-agent.mjs';
 
-function fixture(allowFullRead = false) {
+function fixture(allowFullRead = false, options = {}) {
   const sent = [];
   const requests = [];
   const errors = [];
+  const launches = [];
   const child = new EventEmitter();
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
@@ -24,13 +26,13 @@ function fixture(allowFullRead = false) {
     }
   });
   const agent = createCodexAgent({ machineId: randomUUID(), workspace: process.cwd(), allowFullRead,
-    send: (event) => { sent.push(event); return true; }, spawnProcess: () => child,
-    logger: { error: (message) => errors.push(message) } });
+    send: (event) => { sent.push(event); return true; }, spawnProcess: (...args) => { launches.push(args); return child; },
+    logger: { error: (message) => errors.push(message) }, ...options });
   const start = { type: 'task.start', agentId: CODEX_AGENT_ID,
     sessionId: randomUUID(), taskId: randomUUID(), runId: randomUUID(), prompt: 'Summarize package.json' };
   const reply = (message) => child.stdout.write(`${JSON.stringify(message)}\n`);
   const tick = () => new Promise((resolve) => setImmediate(resolve));
-  return { agent, sent, requests, errors, child, start, reply, tick, allowFullRead };
+  return { agent, sent, requests, errors, child, start, reply, tick, allowFullRead, launches };
 }
 
 async function startThread(f, method = 'thread/start') {
@@ -47,13 +49,23 @@ async function startThread(f, method = 'thread/start') {
   assert.equal(f.requests[3].method, 'configRequirements/read');
   f.reply({ id: f.requests[3].id, result: { requirements: null } });
   await f.tick();
-  assert.equal(f.requests[4].method, method);
-  const threadParams = f.requests[4].params;
+  if (f.requests.at(-1).method === 'config/read') {
+    f.reply({ id: f.requests.at(-1).id, result: { config: {
+      mcp_servers: { privateService: { enabled: true, command: 'not-run' } }, plugins: { 'demo@local': { enabled: true } },
+    } } });
+    await f.tick();
+    assert.equal(f.requests.at(-1).params.config.features.apps, false);
+    assert.equal(f.requests.at(-1).params.config.features.plugins, false);
+    assert.deepEqual(f.requests.at(-1).params.config.mcp_servers.privateService, { enabled: false });
+    assert.deepEqual(f.requests.at(-1).params.config.plugins['demo@local'], { enabled: false });
+  }
+  assert.equal(f.requests.at(-1).method, method);
+  const threadParams = f.requests.at(-1).params;
   assert.equal(threadParams.approvalPolicy, 'on-request');
   assert.equal(threadParams.sandbox, undefined, 'sandbox must not override the named permissions profile');
   if (f.allowFullRead) {
     assert.equal(threadParams.permissions, ':read-only');
-    assert.equal(threadParams.config, undefined);
+    if (!threadParams.approvalsReviewer) assert.equal(threadParams.config, undefined);
   } else {
     assert.deepEqual(threadParams.config.permissions[threadParams.permissions], {
       filesystem: { ':minimal': 'read', [process.cwd()]: 'read' }, network: { enabled: false },
@@ -64,15 +76,16 @@ async function startThread(f, method = 'thread/start') {
 
 async function startTurn(f) {
   const threadParams = await startThread(f);
-  f.reply({ id: f.requests[4].id, result: { thread: { id: 'thread-test' },
+  f.reply({ id: f.requests.at(-1).id, result: { thread: { id: 'thread-test' },
     sandbox: { type: 'readOnly', networkAccess: false },
+    approvalsReviewer: 'user',
     approvalPolicy: 'on-request', activePermissionProfile: { id: threadParams.permissions, extends: null } } });
   await f.tick();
-  assert.equal(f.requests[5].method, 'turn/start');
-  assert.equal(f.requests[5].params.approvalPolicy, 'on-request');
-  assert.equal(f.requests[5].params.permissions, threadParams.permissions);
-  assert.equal(f.requests[5].params.sandboxPolicy, undefined);
-  f.reply({ id: f.requests[5].id, result: { turn: { id: 'turn-test' } } });
+  assert.equal(f.requests.at(-1).method, 'turn/start');
+  assert.equal(f.requests.at(-1).params.approvalPolicy, 'on-request');
+  assert.equal(f.requests.at(-1).params.permissions, threadParams.permissions);
+  assert.equal(f.requests.at(-1).params.sandboxPolicy, undefined);
+  f.reply({ id: f.requests.at(-1).id, result: { turn: { id: 'turn-test' } } });
   await f.tick();
 }
 
@@ -309,6 +322,205 @@ test('failed turn reports the known workspace-requirements error with safe codes
     assert.match(f.errors[0], /httpConnectionFailed; HTTP 503/);
     assert.equal(JSON.stringify([f.sent, f.errors]).includes('private'), false);
     assert.equal(f.sent.filter(event => event.type === 'task.failed').length, 1);
+  } finally { f.agent.stop(); }
+});
+
+test('real command approval stays paused and accepts only the exact decision once', async () => {
+  const command = 'git push origin HEAD:refs/heads/phone-demo';
+  const f = fixture(true, { approvalCommand: command });
+  try {
+    await startTurn(f);
+    f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: pathToFileURL(process.cwd()).href,
+    } });
+    await f.tick();
+    const approval = f.sent.at(-1);
+    assert.equal(approval.type, 'approval.required');
+    assert.equal(f.requests.some(request => request.id === 91), false, 'no response before the phone decision');
+    const response = { ...approval, type: 'approval.response', approved: true };
+    assert.equal(f.agent.receive({ ...response, actionDigest: '0'.repeat(64) }), false);
+    assert.equal(f.agent.receive(response), true);
+    assert.equal(f.agent.receive(response), false);
+    assert.deepEqual(f.requests.filter(request => request.id === 91), [{ id: 91, result: { decision: 'accept' } }]);
+    f.reply({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test',
+      item: { id: 'protected-push', type: 'commandExecution', status: 'completed', exitCode: 0 } } });
+    f.reply({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test',
+      item: { type: 'agentMessage', phase: 'final_answer', text: 'The protected push completed.' } } });
+    f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.completed');
+    assert.equal(f.agent.receive(f.start), false, 'a replayed task must not start another Codex process');
+  } finally { f.agent.stop(); }
+});
+
+test('demo push shortcut sends the exact configured action but still waits for rejection', async () => {
+  const command = 'git push origin HEAD:refs/heads/phone-demo';
+  const f = fixture(true, { approvalCommand: command });
+  f.start.prompt = 'Run the demo push.';
+  try {
+    await startTurn(f);
+    const prompt = f.requests.find(request => request.method === 'turn/start').params.input[0].text;
+    assert.ok(prompt.includes(command), 'the model receives the literal configured command, not spoken punctuation');
+    assert.match(prompt, /not approval/i);
+    assert.match(prompt, /Do not modify or commit files/);
+    assert.equal(f.sent.some(event => event.type === 'approval.required'), false);
+    f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: process.cwd(),
+    } });
+    await f.tick();
+    const approval = f.sent.at(-1);
+    assert.equal(approval.type, 'approval.required');
+    assert.equal(f.requests.some(request => request.id === 91), false, 'shortcut is not authorization');
+    assert.equal(f.agent.receive({ ...approval, type: 'approval.response', approved: false }), true);
+    assert.deepEqual(f.requests.filter(request => request.id === 91), [{ id: 91, result: { decision: 'cancel' } }]);
+    assert.equal(f.sent.at(-1).type, 'task.failed');
+    assert.equal(f.requests.some(request => request.result?.decision === 'accept'), false);
+  } finally { f.agent.stop(); }
+});
+
+test('demo push shortcut fails before launching Codex when its command is not configured', () => {
+  for (const approvalCommand of [undefined, 'git push origin HEAD:refs/heads/main']) {
+    const f = fixture(true, { approvalCommand });
+    f.start.prompt = 'Please run the demo push!';
+    try {
+      assert.equal(f.agent.receive(f.start), true);
+      assert.equal(f.launches.length, 0);
+      assert.equal(f.requests.length, 0);
+      assert.equal(f.sent.at(-1).type, 'task.failed');
+      assert.match(f.sent.at(-1).reason, /demo push shortcut is not configured/);
+      assert.deepEqual(f.agent.activeRunIds(), []);
+      assert.equal(f.agent.receive(f.start), false, 'failed shortcut is deduplicated too');
+    } finally { f.agent.stop(); }
+  }
+});
+
+test('demo push shortcut cannot turn a model success claim without approval into success', async () => {
+  const f = fixture(true, { approvalCommand: 'git push origin HEAD:refs/heads/phone-demo' });
+  f.start.prompt = 'Run the demo push.';
+  try {
+    await startTurn(f);
+    f.reply({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test',
+      item: { type: 'agentMessage', phase: 'final_answer', text: 'The push succeeded!' } } });
+    f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.failed');
+    assert.match(f.sent.at(-1).reason, /did not reach a verified approval request/);
+    assert.equal(f.sent.some(event => ['agent.message', 'task.completed', 'approval.required'].includes(event.type)), false);
+  } finally { f.agent.stop(); }
+});
+
+test('demo push shortcut never relaxes command, workspace or runtime identity checks', async () => {
+  const command = 'git push origin HEAD:refs/heads/phone-demo';
+  for (const change of [{ command: 'git push origin head:refs/head/phone-demo' },
+    { command: `${command}; echo extra` }, { cwd: `${process.cwd()}/elsewhere` }, { turnId: 'wrong-turn' }]) {
+    const f = fixture(true, { approvalCommand: command });
+    f.start.prompt = 'Run the demo push.';
+    try {
+      await startTurn(f);
+      f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+        threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: process.cwd(), ...change,
+      } });
+      await f.tick();
+      assert.deepEqual(f.requests.filter(request => request.id === 91), [{ id: 91, result: { decision: 'decline' } }]);
+      assert.equal(f.sent.some(event => event.type === 'approval.required'), false);
+    } finally { f.agent.stop(); }
+  }
+});
+
+test('protected-mode rejection reports a safe local diagnostic but never sends it to the caller', async () => {
+  const diagnostics = [];
+  const f = fixture(true, { approvalCommand: 'git push origin phone-demo',
+    onApprovalDiagnostic: diagnostic => diagnostics.push(diagnostic) });
+  try {
+    await startTurn(f);
+    f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push',
+      command: 'powershell.exe -Command "private command"', cwd: pathToFileURL(process.cwd()).href,
+      reason: 'private reason',
+    } });
+    await f.tick();
+    assert.deepEqual(f.requests.at(-1), { id: 91, result: { decision: 'decline' } });
+    assert.deepEqual(diagnostics.map(({ commandPreview, ...classification }) => classification), [{ code: 'command-mismatch', requestType: 'command',
+      commandForm: 'powershell-wrapper', cwdForm: 'file-url', cwdMatches: true }]);
+    assert.equal(diagnostics[0].commandPreview.shape, 'powershell.exe -Command "<other> <other>"');
+    f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
+    await f.tick();
+    assert.match(f.errors.at(-1), /approval command-mismatch/);
+    assert.equal(JSON.stringify([f.sent, f.errors, diagnostics]).includes('private'), false);
+    assert.equal(JSON.stringify(f.sent).includes('command-mismatch'), false);
+  } finally { f.agent.stop(); }
+});
+
+test('rejection and expiration cancel the real pending request without acceptance', async () => {
+  for (const mode of ['reject', 'expire', 'runtime-cleared']) {
+    const command = 'git push origin HEAD:refs/heads/phone-demo';
+    const f = fixture(true, { approvalCommand: command, approvalTimeoutMs: mode === 'expire' ? 20 : 300_000 });
+    try {
+      await startTurn(f);
+      f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+        threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: process.cwd(),
+      } });
+      await f.tick();
+      if (mode === 'reject') f.agent.receive({ ...f.sent.at(-1), type: 'approval.response', approved: false });
+      if (mode === 'expire') await new Promise(resolve => setTimeout(resolve, 40));
+      if (mode === 'runtime-cleared') {
+        f.reply({ method: 'serverRequest/resolved', params: { threadId: 'thread-test', requestId: 91 } });
+        await f.tick();
+      }
+      assert.equal(f.sent.at(-1).type, 'task.failed');
+      assert.equal(f.requests.some(request => request.result?.decision === 'accept'), false);
+      assert.equal(f.requests.filter(request => request.id === 91).length, 1);
+    } finally { f.agent.stop(); }
+  }
+});
+
+test('approved action requires a matching successful tool result, not merely model-reported success', async () => {
+  for (const outcome of ['failed', 'missing', 'wrong-item']) {
+    const command = 'git push origin HEAD:refs/heads/phone-demo';
+    const f = fixture(true, { approvalCommand: command });
+    try {
+      await startTurn(f);
+      f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+        threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: process.cwd(),
+      } });
+      await f.tick();
+      assert.equal(f.agent.receive({ ...f.sent.at(-1), type: 'approval.response', approved: true }), true);
+      if (outcome !== 'missing') f.reply({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test',
+        item: { id: outcome === 'wrong-item' ? 'other-command' : 'protected-push', type: 'commandExecution',
+          status: outcome === 'failed' ? 'failed' : 'completed', exitCode: outcome === 'failed' ? 1 : 0 } } });
+      f.reply({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test',
+        item: { type: 'agentMessage', phase: 'final_answer', text: 'The push succeeded!' } } });
+      f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
+      await f.tick();
+      assert.equal(f.sent.at(-1).type, 'task.failed');
+      assert.equal(f.sent.some(event => event.type === 'agent.message'), false);
+    } finally { f.agent.stop(); }
+  }
+});
+
+test('protected actions refuse automatic approval reviewers before starting a model turn', async () => {
+  const f = fixture(true, { approvalCommand: 'git push origin phone-demo' });
+  try {
+    const threadParams = await startThread(f);
+    assert.equal(threadParams.approvalsReviewer, 'user');
+    f.reply({ id: f.requests.at(-1).id, result: { thread: { id: 'thread-test' },
+      sandbox: { type: 'readOnly', networkAccess: false }, approvalPolicy: 'on-request',
+      approvalsReviewer: 'auto_review', activePermissionProfile: { id: ':read-only', extends: null } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.failed');
+    assert.equal(f.requests.some(request => request.method === 'turn/start'), false);
+  } finally { f.agent.stop(); }
+});
+
+test('the spawned runtime does not inherit telephony keys or the voice API key', () => {
+  const f = fixture(true, { approvalCommand: 'git push origin phone-demo', processEnv: {
+    PATH: 'runtime-path', TWILIO_AUTH_TOKEN: 'secret', DAEMON_TOKEN: 'secret', DAEMON_CREDENTIALS: 'secret',
+    OPENAI_API_KEY: 'voice-secret', DEMO_PIN_HASH: 'secret', USERPROFILE: 'local-user',
+  } });
+  try {
+    f.agent.receive(f.start);
+    assert.deepEqual(f.launches[0][2].env, { PATH: 'runtime-path', USERPROFILE: 'local-user' });
+    assert.deepEqual(f.launches[0][1], ['-c', 'features.apps=false', '-c', 'features.plugins=false', 'app-server']);
   } finally { f.agent.stop(); }
 });
 

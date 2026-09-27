@@ -1,18 +1,28 @@
 const E164 = /^\+[1-9]\d{7,14}$/;
 
-export async function createTwilioCallback({ accountSid, authToken, from, to, url, fetchImpl = fetch }) {
+export async function createTwilioCallback({ accountSid, authToken, from, to, url, statusUrl, fetchImpl = fetch }) {
   if (!/^AC[0-9a-fA-F]{32}$/.test(accountSid) || !authToken || !E164.test(from) || !E164.test(to)) {
     throw new Error('invalid Twilio callback configuration');
   }
   const target = new URL(url);
   if (target.protocol !== 'https:') throw new Error('callback webhook must use HTTPS');
+  const statusTarget = statusUrl ? new URL(statusUrl) : null;
+  if (statusTarget && (statusTarget.protocol !== 'https:' || statusTarget.origin !== target.origin)) {
+    throw new Error('callback status webhook must use the same HTTPS origin');
+  }
+  const body = new URLSearchParams({ From: from, To: to, Url: target.toString(), Method: 'POST', Timeout: '20' });
+  if (statusTarget) {
+    body.set('StatusCallback', statusTarget.toString());
+    body.set('StatusCallbackMethod', 'POST');
+    body.set('StatusCallbackEvent', 'completed');
+  }
   const response = await fetchImpl(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls.json`, {
     method: 'POST',
     headers: {
       Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString('base64')}`,
       'content-type': 'application/x-www-form-urlencoded',
     },
-    body: new URLSearchParams({ From: from, To: to, Url: target.toString(), Method: 'POST' }),
+    body,
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) throw new Error(`Twilio callback creation failed (HTTP ${response.status})`);

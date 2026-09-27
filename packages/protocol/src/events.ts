@@ -15,6 +15,11 @@ const run = {
   runId: InternalId,
 };
 
+const ApprovalRuntime = z.strictObject({
+  threadId: z.string().min(1).max(200), turnId: z.string().min(1).max(200),
+  itemId: z.string().min(1).max(200), requestId: z.string().min(1).max(200),
+});
+
 export const AgentStatus = z.enum(['available', 'idle', 'working', 'offline']);
 
 export const RegisteredAgent = z.strictObject({
@@ -28,11 +33,12 @@ export const RegisteredAgent = z.strictObject({
 export const DaemonEvent = z.discriminatedUnion('type', [
   z.strictObject({ ...common, type: z.literal('machine.register'), name: z.string().min(1).max(100), agents: z.array(RegisteredAgent).max(32) }),
   z.strictObject({ ...common, type: z.literal('machine.heartbeat'), sentAt: z.iso.datetime() }),
+  z.strictObject({ ...common, type: z.literal('machine.reconcile'), activeRunIds: z.array(InternalId).max(1000) }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.started'), codexThreadId: z.string().min(1).max(200), codexTurnId: z.string().min(1).max(200) }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.progress'), text: z.string().min(1).max(2000) }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.message'), text: z.string().min(1).max(4000) }),
   z.strictObject({ ...common, ...run, type: z.literal('human_needed'), reason: z.string().min(1).max(1000) }),
-  z.strictObject({ ...common, ...run, type: z.literal('approval.required'), approvalId: InternalId, actionDigest: z.string().regex(/^[a-f0-9]{64}$/), command: z.string().min(1).max(2000), cwd: z.string().min(1).max(1000), expiresAt: z.iso.datetime() }),
+  z.strictObject({ ...common, ...run, type: z.literal('approval.required'), approvalId: InternalId, actionDigest: z.string().regex(/^[a-f0-9]{64}$/), command: z.string().min(1).max(2000), cwd: z.string().min(1).max(1000), expiresAt: z.iso.datetime(), runtime: ApprovalRuntime.optional(), permissionScope: z.string().max(4000).optional() }),
   z.strictObject({ ...common, ...run, type: z.literal('task.completed'), summary: z.string().min(1).max(4000) }),
   z.strictObject({ ...common, ...run, type: z.literal('task.failed'), reason: z.string().min(1).max(2000) }),
 ]);
@@ -41,6 +47,7 @@ export const DaemonEvent = z.discriminatedUnion('type', [
 // request before unblocking a protected action.
 export const ServerEvent = z.discriminatedUnion('type', [
   z.strictObject({ ...common, type: z.literal('machine.registered'), heartbeatIntervalMs: z.number().int().min(1000).max(60000) }),
+  z.strictObject({ ...common, type: z.literal('event.ack'), ackEventId: InternalId }),
   z.strictObject({ ...common, ...run, type: z.literal('task.start'), agentId: InternalId, prompt: z.string().min(1).max(10000), codexThreadId: z.string().min(1).max(200).optional(), scenario: z.enum(['basic', 'approval']).optional() }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.message'), text: z.string().min(1).max(4000) }),
   z.strictObject({ ...common, ...run, type: z.literal('task.cancel') }),

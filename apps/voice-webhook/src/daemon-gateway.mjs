@@ -91,10 +91,15 @@ export function createDaemonGateway({ credentials = new Map(), onEvent = () => {
         seen = new Set();
         seenEvents.set(authenticatedMachineId, seen);
       }
-      if (seen.has(event.eventId)) return;
-      seen.add(event.eventId);
-      if (seen.size > MAX_SEEN_EVENTS) seen.delete(seen.values().next().value);
-      try { onEvent(event); }
+      const acknowledge = () => websocket.send(JSON.stringify({ v: PROTOCOL_VERSION,
+        eventId: randomUUID(), machineId: authenticatedMachineId, type: 'event.ack', ackEventId: event.eventId }));
+      if (seen.has(event.eventId)) { acknowledge(); return; }
+      try {
+        onEvent(event);
+        seen.add(event.eventId);
+        if (seen.size > MAX_SEEN_EVENTS) seen.delete(seen.values().next().value);
+        acknowledge();
+      }
       catch (error) {
         console.error(`Daemon event could not be applied: ${error.message}`);
         websocket.close(1011, 'event processing failed');

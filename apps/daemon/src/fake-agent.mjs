@@ -12,6 +12,7 @@ export function createFakeAgent({ machineId, send, delayMs = COMPLETION_DELAY_MS
   const pending = [];
 
   function emit(run, type, fields) {
+    if (type === 'task.completed' || type === 'task.failed') run.finished = true;
     pending.push({
       v: PROTOCOL_VERSION, eventId: randomUUID(), machineId,
       sessionId: run.sessionId, taskId: run.taskId, runId: run.runId,
@@ -81,5 +82,6 @@ export function createFakeAgent({ machineId, send, delayMs = COMPLETION_DELAY_MS
     pending.length = 0;
   }
 
-  return { receive, flush, stop, pendingCount: () => pending.length };
+  return { receive, flush, stop, pendingCount: () => pending.length,
+    activeRunIds: () => [...runs.values()].filter(run => !run.finished).map(run => run.runId) };
 }

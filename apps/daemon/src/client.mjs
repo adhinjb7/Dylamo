@@ -42,6 +42,7 @@ export function createDaemonClient({
   let heartbeatTimer;
   let registerTimer;
   let lastConnectedAt = null;
+  const unacknowledged = new Map();
 
   function setState(next) {
     if (state === next) return;
@@ -62,6 +63,9 @@ export function createDaemonClient({
     const parsed = DaemonEvent.safeParse(event);
     if (!parsed.success || parsed.data.machineId !== machineId) throw new Error('invalid or mismatched daemon event');
     if (state !== 'online' || socket?.readyState !== WebSocket.OPEN) return false;
+    // Snapshots describe this connection's current state, not durable history.
+    // Replaying an older snapshot could incorrectly fail a newly active run.
+    if (!event.type.startsWith('machine.')) unacknowledged.set(event.eventId, parsed.data);
     socket.send(JSON.stringify(parsed.data));
     return true;
   }
@@ -102,7 +106,11 @@ export function createDaemonClient({
         registerTimer = undefined;
         attempt = 0;
         lastConnectedAt = new Date().toISOString();
-        setState('online');
+        state = 'online';
+        // Replay completed events before the adapter's live-run snapshot. A
+        // lost final event must not be misclassified as a daemon crash.
+        for (const event of unacknowledged.values()) current.send(JSON.stringify(event));
+        onStatus('online');
         heartbeatTimer = setInterval(() => {
           send({ v: PROTOCOL_VERSION, eventId: randomUUID(), machineId, type: 'machine.heartbeat', sentAt: new Date().toISOString() });
         }, event.heartbeatIntervalMs);
@@ -110,6 +118,7 @@ export function createDaemonClient({
         return;
       }
       if (event.type === 'machine.registered') return current.close(1008, 'duplicate registration');
+      if (event.type === 'event.ack') { unacknowledged.delete(event.ackEventId); return; }
       onEvent(event);
     });
     current.on('unexpected-response', (_request, response) => {

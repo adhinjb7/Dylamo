@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import WebSocket from 'ws';
 import { createDaemonGateway, parseDaemonCredentials } from '../../voice-webhook/src/daemon-gateway.mjs';
@@ -144,4 +145,42 @@ test('management endpoint exposes status on loopback without credentials', async
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test('unacknowledged run events replay before a fresh snapshot, but stale snapshots never replay', async () => {
+  const sockets = [];
+  class Socket extends EventEmitter {
+    readyState = WebSocket.OPEN;
+    sent = [];
+    send(raw) { this.sent.push(JSON.parse(raw)); }
+    close() { this.readyState = WebSocket.CLOSED; this.emit('close'); }
+    receive(event) { this.emit('message', Buffer.from(JSON.stringify({ v: 1, eventId: randomUUID(), machineId, ...event })), false); }
+  }
+  const client = newClient('ws://127.0.0.1:1/daemon', {
+    createSocket() { const socket = new Socket(); sockets.push(socket); return socket; },
+    onStatus(status) { if (status === 'online') client.send({ v: 1, eventId: randomUUID(), machineId,
+      type: 'machine.reconcile', activeRunIds: [] }); },
+  });
+  const register = socket => {
+    socket.emit('open');
+    socket.receive({ type: 'machine.registered', heartbeatIntervalMs: 15000 });
+  };
+  try {
+    client.start();
+    register(sockets[0]);
+    const terminal = { v: 1, eventId: randomUUID(), machineId, sessionId, taskId, runId,
+      type: 'task.completed', summary: 'Done.' };
+    client.send(terminal);
+    sockets[0].close(); // The completion or its ACK was lost.
+    await waitFor(() => sockets.length === 2);
+    register(sockets[1]);
+    assert.deepEqual(sockets[1].sent.map(event => event.type), ['machine.register', 'task.completed', 'machine.reconcile']);
+    assert.equal(sockets[1].sent[1].eventId, terminal.eventId);
+    assert.notEqual(sockets[1].sent[2].eventId, sockets[0].sent[1].eventId);
+    sockets[1].receive({ type: 'event.ack', ackEventId: terminal.eventId });
+    sockets[1].close();
+    await waitFor(() => sockets.length === 3);
+    register(sockets[2]);
+    assert.deepEqual(sockets[2].sent.map(event => event.type), ['machine.register', 'machine.reconcile']);
+  } finally { client.stop(); }
 });

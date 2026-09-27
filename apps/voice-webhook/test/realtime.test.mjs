@@ -33,6 +33,7 @@ test('Realtime bridge configures PCMU and forwards audio both ways', () => {
   assert.equal(upstream.sent[0].type, 'session.update');
   assert.equal(upstream.sent[0].session.audio.input.format.type, 'audio/pcmu');
   assert.equal(upstream.sent[0].session.audio.output.format.type, 'audio/pcmu');
+  assert.equal(upstream.sent[0].session.audio.input.transcription, undefined, 'voice-only mode is unchanged');
   upstream.receive({ type: 'session.updated' });
   assert.deepEqual(upstream.sent[1], { type: 'input_audio_buffer.append', audio: 'AAAA' });
 
@@ -56,20 +57,68 @@ test('controlled Realtime transcribes without auto-reply and speaks only server 
   const twilio = new FakeSocket();
   const upstream = new FakeSocket();
   const transcripts = [];
+  const speechEvents = [];
   const bridge = connectRealtime({
     twilio, streamSid: `MZ${'b'.repeat(32)}`, apiKey: 'test-key', controlled: true,
     onTranscript: (text) => transcripts.push(text), createSocket: () => upstream,
+    onSpeechStart: () => speechEvents.push('start'), onSpeechStop: () => speechEvents.push('stop'),
   });
   try {
     assert.equal(bridge.speak('Starting a demo task.'), true);
     upstream.emit('open');
     assert.equal(upstream.sent[0].session.audio.input.transcription.model, 'gpt-transcribe');
+    assert.deepEqual(upstream.sent[0].session.audio.input.transcription.languages, ['en']);
+    assert.equal(upstream.sent[0].session.audio.input.transcription.language, undefined);
+    assert.ok(upstream.sent[0].session.audio.input.transcription.keywords.includes('Run the demo push'));
+    assert.match(upstream.sent[0].session.audio.input.transcription.prompt, /English.*Dylamo.*Codex/);
     assert.equal(upstream.sent[0].session.audio.input.turn_detection.create_response, false);
     upstream.receive({ type: 'session.updated' });
     assert.equal(upstream.sent[1].type, 'response.create');
     assert.match(upstream.sent[1].response.instructions, /Starting a demo task/);
     upstream.receive({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'item1', transcript: 'Please check my repository.' });
     assert.deepEqual(transcripts, ['Please check my repository.']);
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({ type: 'input_audio_buffer.speech_stopped' });
+    assert.deepEqual(speechEvents, ['start', 'stop']);
+  } finally { bridge.close(); }
+});
+
+test('transcription hints never rewrite garbled text or turn transcription failure into a task', () => {
+  const twilio = new FakeSocket();
+  const upstream = new FakeSocket();
+  const transcripts = [];
+  let failures = 0;
+  const bridge = connectRealtime({ twilio, streamSid: 'MZtranscription', apiKey: 'test-key', controlled: true,
+    onTranscript: text => transcripts.push(text), onTranscriptionFailure: () => { failures++; }, createSocket: () => upstream });
+  try {
+    upstream.receive({ type: 'session.updated' });
+    for (const transcript of ['走走。', 'Randh denopush.', 'Do not run the demo push.']) {
+      upstream.receive({ type: 'conversation.item.input_audio_transcription.completed', transcript });
+    }
+    assert.deepEqual(transcripts, ['走走。', 'Randh denopush.', 'Do not run the demo push.']);
+    upstream.receive({ type: 'conversation.item.input_audio_transcription.failed', error: { message: 'private failure detail' } });
+    assert.equal(transcripts.length, 3);
+    assert.equal(failures, 1);
+    assert.match(upstream.sent.at(-1).response.instructions, /Please repeat your request/);
+    assert.equal(JSON.stringify(upstream.sent).includes('private failure detail'), false);
+    assert.equal(twilio.readyState, WebSocket.OPEN);
+  } finally { bridge.close(); }
+});
+
+test('duplicate transcript events cannot replay a task or its confirmation', () => {
+  const twilio = new FakeSocket();
+  const upstream = new FakeSocket();
+  const transcripts = [];
+  const bridge = connectRealtime({ twilio, streamSid: 'MZduplicates', apiKey: 'test-key', controlled: true,
+    onTranscript: (text, id) => transcripts.push({ text, id }), createSocket: () => upstream });
+  try {
+    const task = { type: 'conversation.item.input_audio_transcription.completed', item_id: 'task-item', transcript: 'Run the demo push.' };
+    const confirmation = { ...task, item_id: 'confirmation-item', transcript: 'Yes, start it.' };
+    for (const event of [task, confirmation, task, confirmation]) upstream.receive(event);
+    assert.deepEqual(transcripts, [{ text: task.transcript, id: task.item_id },
+      { text: confirmation.transcript, id: confirmation.item_id }]);
+    upstream.receive({ ...task, item_id: 'new-utterance' });
+    assert.equal(transcripts.length, 3, 'distinct utterances may have the same words');
   } finally { bridge.close(); }
 });
 
@@ -141,13 +190,65 @@ test('an active-response conflict waits for completion and retries the rejected 
   } finally { f.bridge.close(); }
 });
 
-test('controlled speech is not truncated by caller speech while automatic interruption is disabled', () => {
+test('controlled barge-in cancels generation, clears playback and drops late audio without cancelling the task', () => {
   const f = controlledFixture();
   try {
-    f.upstream.receive({ type: 'response.output_audio.delta', item_id: 'spoken-result',
-      content_index: 0, delta: Buffer.alloc(800, 0xff).toString('base64') });
+    f.upstream.receive({ type: 'session.updated' });
+    f.bridge.speak('A long result.');
+    f.bridge.speak('An old queued reminder.');
+    f.upstream.receive({ type: 'response.created', response: { id: 'resp-long' } });
+    const audio = { type: 'response.output_audio.delta', response_id: 'resp-long', item_id: 'spoken-result',
+      content_index: 0, delta: Buffer.alloc(800, 0xff).toString('base64') };
+    f.upstream.receive(audio);
+    f.bridge.acknowledgeMark(f.twilio.sent.at(-1).mark.name);
+    f.upstream.receive(audio);
+    const clearedMark = f.twilio.sent.at(-1).mark.name;
     f.upstream.receive({ type: 'input_audio_buffer.speech_started' });
-    assert.equal(f.twilio.sent.some((event) => event.event === 'clear'), false);
-    assert.equal(f.upstream.sent.some((event) => event.type === 'conversation.item.truncate'), false);
+    assert.equal(f.twilio.sent.at(-1).event, 'clear');
+    assert.equal(f.upstream.sent.find(event => event.type === 'response.cancel').response_id, 'resp-long');
+    assert.deepEqual(f.upstream.sent.at(-1), { type: 'conversation.item.truncate', item_id: 'spoken-result', content_index: 0, audio_end_ms: 100 });
+    f.bridge.acknowledgeMark(clearedMark); // Twilio returns marks for cleared audio too.
+    f.upstream.receive(audio);
+    assert.equal(f.twilio.sent.at(-1).event, 'clear', 'late audio is not played');
+    f.bridge.speak('A new task result arriving during caller speech.');
+    f.upstream.receive({ type: 'response.done', response: { id: 'resp-long', status: 'cancelled' } });
+    assert.equal(f.responses().length, 1, 'wait until the caller stops speaking');
+    f.upstream.receive({ type: 'input_audio_buffer.speech_stopped' });
+    assert.equal(f.responses().length, 2);
+    assert.match(f.responses()[1].response.instructions, /new task result/);
+    assert.equal(f.twilio.readyState, WebSocket.OPEN);
+  } finally { f.bridge.close(); }
+});
+
+test('barge-in before response.created cancels by ID once it arrives and tolerates a completion race', () => {
+  const f = controlledFixture();
+  try {
+    f.upstream.receive({ type: 'session.updated' });
+    f.bridge.speak('Checking now.');
+    f.upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    assert.equal(f.upstream.sent.some(event => event.type === 'response.cancel'), false);
+    f.upstream.receive({ type: 'response.created', response: { id: 'late-created' } });
+    const cancel = f.upstream.sent.at(-1);
+    assert.equal(cancel.type, 'response.cancel');
+    f.upstream.receive({ type: 'error', error: { code: 'response_cancel_not_active', event_id: cancel.event_id } });
+    f.upstream.receive({ type: 'response.done', response: { id: 'late-created', status: 'completed' } });
+    assert.equal(f.twilio.readyState, WebSocket.OPEN);
+    assert.deepEqual(f.errors, []);
+  } finally { f.bridge.close(); }
+});
+
+test('controlled renderer waits for Twilio playback before starting another response', () => {
+  const f = controlledFixture();
+  try {
+    f.upstream.receive({ type: 'session.updated' });
+    f.bridge.speak('First.');
+    f.bridge.speak('Second.');
+    f.upstream.receive({ type: 'response.created', response: { id: 'first' } });
+    f.upstream.receive({ type: 'response.output_audio.delta', response_id: 'first', item_id: 'first-item',
+      delta: Buffer.alloc(800, 0xff).toString('base64') });
+    f.upstream.receive({ type: 'response.done', response: { id: 'first', status: 'completed' } });
+    assert.equal(f.responses().length, 1);
+    f.bridge.acknowledgeMark(f.twilio.sent.at(-1).mark.name);
+    assert.equal(f.responses().length, 2);
   } finally { f.bridge.close(); }
 });

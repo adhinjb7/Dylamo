@@ -7,6 +7,8 @@ import { connectRealtime } from './realtime.mjs';
 import { validateTwilioSignature } from './signature.mjs';
 import { createDaemonGateway } from './daemon-gateway.mjs';
 import { createTwilioCallback } from './callback.mjs';
+import { isStatusRequest } from './transcript-intent.mjs';
+import { createTaskReadback } from './task-readback.mjs';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const XML_START = '<?xml version="1.0" encoding="UTF-8"?>';
@@ -15,6 +17,9 @@ const LOCK_MS = 15 * 60 * 1000;
 const CALL_TTL_MS = 30 * 60 * 1000;
 const STREAM_MS = 12 * 1000;
 const REALTIME_CALL_MS = 5 * 60 * 1000;
+const FIRST_STATUS_MS = 15 * 1000;
+const REPEAT_STATUS_MS = 30 * 1000;
+const SPEAKING_RETRY_MS = 3 * 1000;
 
 function twiml(content) {
   return `${XML_START}<Response>${content}</Response>`;
@@ -76,7 +81,7 @@ async function readBody(request) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-export function createServer({ authToken, accountSid, publicBaseUrl, allowedCallerNumber, callbackCallerNumber, pinHash, voiceMode = 'tone', agentMode = 'voice', openAiApiKey, realtimeConnector = connectRealtime, callbackCreator = createTwilioCallback, daemonCredentials = new Map(), onDaemonEvent, onDaemonStatus, stateStore, now = Date.now }) {
+export function createServer({ authToken, accountSid, publicBaseUrl, allowedCallerNumber, callbackCallerNumber, pinHash, voiceMode = 'tone', agentMode = 'voice', openAiApiKey, codexApprovalEnabled = false, realtimeConnector = connectRealtime, callbackCreator = createTwilioCallback, daemonCredentials = new Map(), onDaemonEvent, onDaemonStatus, stateStore, now = Date.now, statusTiming = { firstMs: FIRST_STATUS_MS, repeatMs: REPEAT_STATUS_MS } }) {
   if (!authToken || !accountSid || !publicBaseUrl || !allowedCallerNumber || !pinHash) {
     throw new Error('TWILIO_AUTH_TOKEN, TWILIO_ACCOUNT_SID, PUBLIC_BASE_URL, ALLOWED_CALLER_NUMBER, and DEMO_PIN_HASH are required');
   }
@@ -97,6 +102,8 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     throw new Error('TWILIO_PHONE_NUMBER must be a valid E.164 number');
   }
   if (voiceMode === 'realtime' && !openAiApiKey) throw new Error('OPENAI_API_KEY is required when VOICE_MODE=realtime');
+  if (codexApprovalEnabled && (agentMode !== 'codex' || !callbackCallerNumber)) throw new Error('Codex approvals require codex mode and TWILIO_PHONE_NUMBER');
+  const callbacksEnabled = Boolean(callbackCallerNumber && (agentMode === 'fake' || codexApprovalEnabled));
 
   const user = stateStore?.ensureUser({ phoneNumber: allowedCallerNumber, pinHash });
   if (user) {
@@ -108,7 +115,32 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
   const calls = new Map();
   const failures = new Map();
   const agentsByMachine = new Map();
+  const reconcileCandidates = new Map();
   const websocketServer = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 });
+
+  function clearTaskStatus(call) {
+    if (call?.statusTimer) clearTimeout(call.statusTimer);
+    if (call) call.statusTimer = null;
+  }
+
+  function scheduleTaskStatus(call, delayMs = statusTiming.firstMs) {
+    clearTaskStatus(call);
+    if (agentMode !== 'codex' || !call?.taskId || !call.realtime) return;
+    call.statusTimer = setTimeout(() => {
+      call.statusTimer = null;
+      if (!call.taskId || !call.realtime) return;
+      const taskState = stateStore.getTask(call.taskId)?.state;
+      if (!['queued', 'running'].includes(taskState)) return;
+      if (call.callerSpeaking) {
+        scheduleTaskStatus(call, statusTiming.retryMs ?? SPEAKING_RETRY_MS);
+        return;
+      }
+      call.realtime.speak(taskState === 'queued' ? 'Your request is waiting for Codex to start.'
+        : 'Codex is still working on your request. I will let you know when it finishes.');
+      scheduleTaskStatus(call, statusTiming.repeatMs);
+    }, delayMs);
+    call.statusTimer.unref?.();
+  }
 
   function applyAgentEvent(event) {
     if (agentMode === 'voice' || !['agent.started', 'agent.progress', 'agent.message', 'approval.required', 'task.completed', 'task.failed'].includes(event.type)) return false;
@@ -129,11 +161,33 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     if (task.state === 'queued') stateStore.transitionTask(task.id, 'running');
     if (event.type === 'agent.started') stateStore.setCodexRunIds(run.id, event.codexThreadId, event.codexTurnId);
     if (event.type === 'approval.required') {
-      if (agentMode === 'codex') throw new Error('real approval bridge is not enabled');
-      if (stateStore.getApproval(event.approvalId)) return false;
+      if (agentMode === 'codex' && (!codexApprovalEnabled || !event.runtime ||
+          event.runtime.threadId !== run.codex_thread_id || event.runtime.turnId !== run.codex_turn_id)) {
+        throw new Error('real approval bridge is not enabled or runtime IDs do not match');
+      }
+      const prior = stateStore.getApproval(event.approvalId);
+      if (prior) {
+        if (prior.run_id !== run.id || prior.action_digest !== event.actionDigest || prior.command !== event.command || prior.cwd !== event.cwd) {
+          throw new Error('approval identity cannot be reused for a changed action');
+        }
+        return false;
+      }
+      if (Date.parse(event.expiresAt) <= now()) {
+        // A disconnected daemon may replay a request only after it expired.
+        // Settle it instead of repeatedly rejecting the same durable event and
+        // preventing subsequent events from draining on every reconnect.
+        const reason = 'The approval expired before it could be delivered. The action remains blocked.';
+        stateStore.setTaskResult(task.id, reason);
+        stateStore.expirePendingApprovalsForRun(run.id);
+        stateStore.transitionRun(run.id, 'failed', event.eventId);
+        stateStore.transitionTask(task.id, 'failed');
+        stateStore.audit(session.id, 'approval.expired_before_delivery', { eventId: event.eventId, runId: run.id });
+        return { ...event, type: 'task.failed', reason };
+      }
       stateStore.createApproval({
         approvalId: event.approvalId, runId: run.id, actionDigest: event.actionDigest,
         command: event.command, cwd: event.cwd, expiresAt: Date.parse(event.expiresAt),
+        codexItemId: event.runtime?.itemId, codexRequestId: event.runtime?.requestId, permissionScope: event.permissionScope,
       });
       stateStore.transitionRun(run.id, 'waiting_human', event.eventId);
       stateStore.transitionTask(task.id, 'waiting_human');
@@ -141,6 +195,7 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     if (event.type === 'task.completed' || event.type === 'task.failed') {
       const finalState = event.type === 'task.completed' ? 'completed' : 'failed';
       if (finalState === 'failed') stateStore.expirePendingApprovalsForRun(run.id);
+      stateStore.setTaskResult(task.id, finalState === 'completed' ? event.summary : event.reason);
       stateStore.transitionRun(run.id, finalState, event.eventId);
       stateStore.transitionTask(task.id, finalState);
     }
@@ -154,13 +209,16 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     if (event.type === 'agent.message') call?.realtime?.speak(event.text);
     if (event.type === 'task.failed') call?.realtime?.speak(agentMode === 'codex' ? event.reason : 'The demo task failed. No files were changed.');
     if (event.type === 'approval.required') {
-      if (call?.realtime) call.realtime.speak('The simulated task needs approval. Hang up and I will call you back to confirm it.');
+      clearTaskStatus(call);
+      if (call?.realtime) call.realtime.speak(agentMode === 'fake'
+        ? 'The simulated task needs approval. Hang up and I will call you back to confirm it.'
+        : 'Codex has paused a protected action. Hang up and I will call you back for your decision.');
       else void initiateApprovalCallback(event.approvalId);
     }
     if (call && agentMode === 'codex' && (event.type === 'task.completed' || event.type === 'task.failed')) {
+      clearTaskStatus(call);
       if (event.type === 'task.completed') {
         call.codexThreadId = stateStore.getRun(event.runId)?.codex_thread_id ?? null;
-        call.realtime?.speak('You can ask a follow-up question now.');
       }
       call.taskId = null;
       call.busyNotified = false;
@@ -168,13 +226,15 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
   }
 
   async function initiateApprovalCallback(approvalId) {
-    if (!callbackCallerNumber || agentMode !== 'fake') return;
+    if (!callbacksEnabled) return;
     const context = stateStore.getApprovalContext(approvalId);
     if (!context || context.state !== 'pending' || context.expires_at <= now() || stateStore.getApprovalCallback(approvalId)) return;
+    if ([...calls.values()].some(call => call.sessionId === context.session_id && call.realtime)) return;
     const callback = stateStore.prepareApprovalCallback(approvalId);
     const url = `${base.origin}/approval/voice?approvalId=${approvalId}&nonce=${callback.nonce}`;
+    const statusUrl = `${base.origin}/approval/status?approvalId=${approvalId}&nonce=${callback.nonce}`;
     try {
-      const callSid = await callbackCreator({ accountSid, authToken, from: callbackCallerNumber, to: allowedCallerNumber, url });
+      const callSid = await callbackCreator({ accountSid, authToken, from: callbackCallerNumber, to: allowedCallerNumber, url, statusUrl });
       stateStore.markApprovalCallbackDialed(approvalId, callSid);
       console.log(`Approval callback initiated for approval ${approvalId}`);
     } catch (error) {
@@ -196,10 +256,27 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     credentials: daemonCredentials,
     onEvent: (event) => {
       if (stateStore) {
+        if (event.type === 'machine.reconcile') {
+          let interrupted = [];
+          stateStore.applyEventOnce(event, () => {
+            interrupted = stateStore.reconcileMachineRuns(event.machineId, event.activeRunIds,
+              reconcileCandidates.get(event.machineId) ?? []);
+          });
+          reconcileCandidates.delete(event.machineId);
+          for (const failure of interrupted) speakToActiveCall(failure);
+          // Recover the crash window between committing approval.required and
+          // initiating its callback. Existing planned/dialed attempts are never
+          // repeated, since their provider outcome could be uncertain.
+          for (const approval of stateStore.getUndialedApprovalsForMachine(event.machineId)) {
+            if (event.activeRunIds.includes(approval.run_id)) void initiateApprovalCallback(approval.id);
+          }
+          onDaemonEvent?.(event);
+          return;
+        }
         let accepted = false;
         const applied = stateStore.applyEventOnce(event, () => { accepted = applyAgentEvent(event); });
         if (!applied) return;
-        if (accepted) speakToActiveCall(event);
+        if (accepted) speakToActiveCall(accepted === true ? event : accepted);
       }
       onDaemonEvent?.(event);
     },
@@ -208,7 +285,9 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
       if (status === 'online') agentsByMachine.set(machineId, agents ?? []);
       else agentsByMachine.delete(machineId);
       onDaemonStatus?.(machineId, status, agents);
-      if (status === 'online' && stateStore && callbackCallerNumber && agentMode === 'fake') {
+      if (status === 'online' && stateStore) reconcileCandidates.set(machineId,
+        stateStore.unfinishedRunsForMachine(machineId).map(run => run.runId));
+      if (status === 'online' && stateStore && callbacksEnabled) {
         for (const approval of stateStore.getDecidedApprovalsForMachine(machineId)) {
           sendApprovalDecision({ ...approval, id: approval.id, machine_id: machineId });
         }
@@ -220,21 +299,46 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
 
   function startAgentTask(call, transcript) {
     if (agentMode === 'voice' || !call.authenticated || typeof transcript !== 'string') return;
-    const prompt = transcript.trim().slice(0, 10_000);
+    let prompt = transcript.trim().slice(0, 10_000);
     if (!prompt) return;
     if (call.taskId) {
+      if (agentMode === 'codex' && stateStore.getTask(call.taskId)?.state === 'waiting_human') {
+        clearTaskStatus(call);
+        call.realtime?.speak('Codex is paused for your approval. Hang up to receive the secure callback.');
+        return;
+      }
+      if (agentMode === 'codex' && isStatusRequest(prompt)) {
+        call.realtime?.speak('Codex is still working on your request. I will let you know when it finishes.');
+        scheduleTaskStatus(call, statusTiming.repeatMs);
+        return;
+      }
       if (agentMode === 'codex' && !call.busyNotified) {
         call.busyNotified = true;
         call.realtime?.speak('I am still working on that request. Please ask again after I answer.');
       }
       return;
     }
+    if (agentMode === 'codex') {
+      call.readback ??= createTaskReadback({ now });
+      const reviewed = call.readback.receive(prompt);
+      if (!reviewed.prompt) {
+        if (reviewed.reply) call.realtime?.speak(reviewed.reply);
+        return;
+      }
+      prompt = reviewed.prompt;
+    }
+    const isFollowUp = agentMode === 'codex' && Boolean(call.codexThreadId);
     const session = stateStore.getSession(call.sessionId);
-    const selected = [...agentsByMachine].flatMap(([machineId, agents]) =>
+    const candidates = [...agentsByMachine].flatMap(([machineId, agents]) =>
       agents.filter((agent) => agent.adapterType === agentMode && agent.status !== 'offline')
-        .map((agent) => ({ machineId, agentId: agent.agentId }))).find(({ machineId, agentId }) =>
+        .map((agent) => ({ machineId, agentId: agent.agentId }))).filter(({ machineId, agentId }) =>
       daemonGateway.status(machineId).online && (!session.machine_id ||
         (session.machine_id === machineId && session.agent_id === agentId)));
+    if (candidates.length > 1) {
+      call.realtime?.speak('More than one agent is available. For this demo, leave only the intended agent connected and try again.');
+      return;
+    }
+    const selected = candidates[0];
     if (!selected) {
       call.realtime?.speak('The selected agent is offline. Please try again shortly.');
       return;
@@ -259,8 +363,9 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
       return;
     }
     stateStore.audit(call.sessionId, 'task.dispatched', { taskId, runId });
+    scheduleTaskStatus(call);
     call.realtime?.speak(agentMode === 'codex'
-      ? 'I started a real Codex task in read-only mode. Stay on the line for the answer and follow-ups, or hang up while it runs.'
+      ? isFollowUp ? 'Checking that now.' : 'I started that request. I will tell you if a protected action needs approval.'
       : 'I started a simulated task. No files will be changed. You can hang up; it will keep running.');
   }
 
@@ -268,7 +373,7 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     if (!call.streamToken) call.streamToken = randomBytes(24).toString('hex');
     const streamUrl = `wss://${base.host}/media`;
     const intro = voiceMode === 'realtime'
-      ? agentMode === 'fake' ? 'Access granted. Connecting the demo agent.' : agentMode === 'codex' ? 'Access granted. Connecting Codex in read-only mode.' : 'Access granted. Connecting the voice assistant.'
+      ? agentMode === 'fake' ? 'Access granted. Connecting the demo agent.' : agentMode === 'codex' ? 'Access granted. Connecting Codex.' : 'Access granted. Connecting the voice assistant.'
       : 'Access granted. Starting a short audio stream test.';
     const ending = voiceMode === 'realtime'
       ? '<Say>The voice assistant disconnected.</Say><Hangup/>'
@@ -311,13 +416,13 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
 
   function approvalPinGather(approvalId, nonce, context) {
     const action = approvalAction('/approval/pin', approvalId, nonce);
-    const description = `A simulated protected action is waiting: ${context.command}, in ${context.cwd}. No command will actually run. Enter your four digit PIN to continue.`;
+    const description = 'An agent needs your decision. Enter your four digit PIN to continue.';
     return twiml(`<Gather input="dtmf" numDigits="4" timeout="8" action="${xmlEscape(action)}" method="POST" actionOnEmptyResult="true"><Say>${xmlEscape(description)}</Say></Gather><Hangup/>`);
   }
 
   function approvalChoiceGather(approvalId, nonce, context) {
     const action = approvalAction('/approval/decision', approvalId, nonce);
-    const description = `Press 1 to approve the simulated action ${context.command}. Press 2 to reject it.`;
+    const description = `Press 1 to approve ${agentMode === 'fake' ? 'the simulated action' : 'this exact action once'}: ${context.command}, in ${context.cwd}. Press 2 to reject it. Press 3 to hear the details again.`;
     return twiml(`<Gather input="dtmf" numDigits="1" timeout="8" action="${xmlEscape(action)}" method="POST" actionOnEmptyResult="true"><Say>${xmlEscape(description)}</Say></Gather><Hangup/>`);
   }
 
@@ -327,7 +432,7 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     if (request.method === 'GET' && path.pathname === '/health') {
       return send(response, 200, 'ok');
     }
-    if (!['/voice', '/voice/pin', '/approval/voice', '/approval/pin', '/approval/decision'].includes(path.pathname) || request.method !== 'POST') {
+    if (!['/voice', '/voice/pin', '/approval/voice', '/approval/pin', '/approval/decision', '/approval/result', '/approval/status'].includes(path.pathname) || request.method !== 'POST') {
       return send(response, 404, 'not found');
     }
     if (!request.headers['content-type']?.toLowerCase().startsWith('application/x-www-form-urlencoded')) {
@@ -355,7 +460,7 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
     const from = params.From;
     const callSid = params.CallSid;
     if (path.pathname.startsWith('/approval/')) {
-      if (agentMode !== 'fake' || !callbackCallerNumber || params.To !== allowedCallerNumber || from !== callbackCallerNumber ||
+      if (!callbacksEnabled || params.To !== allowedCallerNumber || from !== callbackCallerNumber ||
           params.Direction !== 'outbound-api' || !/^CA[0-9a-fA-F]{32}$/.test(callSid ?? '')) {
         return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
       }
@@ -363,6 +468,26 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
       const nonce = path.searchParams.get('nonce');
       const context = stateStore.getApprovalContext(approvalId);
       const callback = stateStore.getApprovalCallback(approvalId);
+      if (path.pathname === '/approval/status') {
+        if (!context || !callback || callback.nonce !== nonce ||
+            (callback.call_sid && callback.call_sid !== callSid)) return send(response, 403, 'forbidden');
+        stateStore.recordApprovalCallEnd({ approvalId, nonce, callSid, status: params.CallStatus });
+        return send(response, 204, '');
+      }
+      if (path.pathname === '/approval/result') {
+        if (!context || !callback || callback.nonce !== nonce || callback.call_sid !== callSid || !callback.pin_verified ||
+            callback.state !== 'finished' || context.state !== 'approved' || isLocked(allowedCallerNumber)) {
+          return send(response, 200, HANGUP, 'text/xml; charset=utf-8');
+        }
+        const task = stateStore.getTask(context.task_id);
+        if (['completed', 'failed', 'cancelled'].includes(task?.state)) {
+          const text = task.state === 'completed' ? `Codex finished. ${task.result_text ?? ''}` : `The task stopped. ${task.result_text ?? ''}`;
+          return send(response, 200, twiml(`<Say>${xmlEscape(text.slice(0, 1000))}</Say><Hangup/>`), 'text/xml; charset=utf-8');
+        }
+        if (now() - context.resolved_at > 60_000) return send(response, 200, twiml('<Say>The task is still pending. Check its status on the laptop before retrying any action.</Say><Hangup/>'), 'text/xml; charset=utf-8');
+        const resultUrl = approvalAction('/approval/result', approvalId, nonce);
+        return send(response, 200, twiml(`<Pause length="2"/><Redirect method="POST">${xmlEscape(resultUrl)}</Redirect>`), 'text/xml; charset=utf-8');
+      }
       if (!context || !callback || callback.nonce !== nonce || context.state !== 'pending' || context.expires_at <= now() || isLocked(allowedCallerNumber)) {
         return send(response, 200, twiml('<Say>This approval is no longer available.</Say><Hangup/>'), 'text/xml; charset=utf-8');
       }
@@ -390,9 +515,11 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
       stateStore.finishApprovalCallback(approvalId, callSid);
       if (decision.state === (approved ? 'approved' : 'rejected')) sendApprovalDecision(decision);
       const message = decision.state === 'approved'
-        ? 'Approved. The fake agent will simulate the action. No command will run.'
-        : 'Rejected. The fake agent will not continue.';
-      return send(response, 200, twiml(`<Say>${message}</Say><Hangup/>`), 'text/xml; charset=utf-8');
+        ? agentMode === 'fake' ? 'Approved. The fake agent will simulate the action. No command will run.' : 'Approved for this action once. Waiting for Codex to report the result.'
+        : decision.state === 'rejected' ? 'Rejected. The agent will not continue.' : 'The approval expired. The action remains blocked.';
+      const ending = agentMode === 'codex' && decision.state === 'approved'
+        ? `<Pause length="2"/><Redirect method="POST">${xmlEscape(approvalAction('/approval/result', approvalId, nonce))}</Redirect>` : '<Hangup/>';
+      return send(response, 200, twiml(`<Say>${message}</Say>${ending}`), 'text/xml; charset=utf-8');
     }
     if (from !== allowedCallerNumber || !/^CA[0-9a-fA-F]{32}$/.test(callSid ?? '')) {
       if (/^CA[0-9a-fA-F]{32}$/.test(callSid ?? '')) {
@@ -516,7 +643,13 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
             realtime = realtimeConnector({
               twilio: websocket, streamSid, apiKey: openAiApiKey,
               controlled: agentMode !== 'voice',
+              onSpeechStart: () => { call.callerSpeaking = true; },
+              onSpeechStop: () => { call.callerSpeaking = false; },
+              onTranscriptionFailure: () => { call.readback?.clear(); },
               onTranscript: (text) => {
+                // A late transcript/confirmation after hangup cannot dispatch a
+                // draft. Already-dispatched daemon tasks remain independent.
+                if (calls.get(callSid) !== call) return;
                 try { startAgentTask(call, text); }
                 catch (error) {
                   console.error(`Could not start agent task: ${error.message}`);
@@ -558,6 +691,8 @@ export function createServer({ authToken, accountSid, publicBaseUrl, allowedCall
       realtime?.close();
       if (callSid) {
         const call = calls.get(callSid);
+        clearTaskStatus(call);
+        call?.readback?.clear();
         calls.delete(callSid);
         try {
           stateStore?.setCallState(callSid, 'ended', 'stream_closed');

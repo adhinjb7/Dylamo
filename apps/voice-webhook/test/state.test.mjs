@@ -55,7 +55,7 @@ test('version one database upgrades to callback schema without losing calls', ()
     first.startInboundCall({ userId: user.id, callSid, phoneNumber });
     first.close();
     const old = new DatabaseSync(path);
-    old.exec('DROP TABLE approval_callbacks; PRAGMA user_version = 1;');
+    old.exec('DROP TABLE approval_callbacks; ALTER TABLE tasks DROP COLUMN result_text; ALTER TABLE approvals DROP COLUMN permission_scope; PRAGMA user_version = 1;');
     old.close();
     const upgraded = openStateStore(path);
     try {
@@ -63,8 +63,11 @@ test('version one database upgrades to callback schema without losing calls', ()
       assert.equal(upgraded.getApprovalCallback(randomUUID()), undefined);
     } finally { upgraded.close(); }
     const check = new DatabaseSync(path, { readOnly: true });
-    assert.equal(check.prepare('PRAGMA user_version').get().user_version, 2);
-    check.close();
+    try {
+      assert.equal(check.prepare('PRAGMA user_version').get().user_version, 3);
+      assert.ok(check.prepare('PRAGMA table_info(tasks)').all().some(column => column.name === 'result_text'));
+      assert.ok(check.prepare('PRAGMA table_info(approvals)').all().some(column => column.name === 'permission_scope'));
+    } finally { check.close(); }
   } finally {
     const target = resolve(directory);
     if (!target.startsWith(resolve(tmpdir()) + sep)) throw new Error('refusing to remove unexpected test directory');
@@ -143,6 +146,38 @@ test('expired approval cannot be approved', () => {
   }, () => time);
 });
 
+test('callback status is bound to its nonce and SID and cannot reopen after a late REST reply', () => {
+  withMemoryStore(store => {
+    const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
+    const { sessionId } = store.startInboundCall({ userId: user.id, callSid, phoneNumber });
+    const taskId = store.createTask({ sessionId, prompt: 'Push demo' });
+    const runId = store.createRun({ taskId, agentId: randomUUID() });
+    store.transitionTask(taskId, 'running');
+    store.transitionRun(runId, 'running');
+    store.transitionTask(taskId, 'waiting_human');
+    store.transitionRun(runId, 'waiting_human');
+    const approvalId = store.createApproval({ runId, actionDigest: 'e'.repeat(64),
+      command: 'git push origin phone-demo', cwd: '/demo', expiresAt: Date.now() + 60000 });
+    const { nonce } = store.prepareApprovalCallback(approvalId);
+    const callbackSid = `CA${'c'.repeat(32)}`;
+    const status = { approvalId, nonce, callSid: callbackSid, status: 'no-answer' };
+    assert.equal(store.recordApprovalCallEnd({ ...status, nonce: 'wrong' }), false);
+    assert.equal(store.recordApprovalCallEnd({ ...status, status: 'ringing' }), false);
+    assert.equal(store.getCall(callbackSid), undefined);
+    assert.equal(store.recordApprovalCallEnd(status), true, 'status may arrive before the REST create response');
+    assert.equal(store.getCall(callbackSid).ended_reason, 'callback_no_answer');
+    store.markApprovalCallbackDialed(approvalId, callbackSid); // Delayed successful REST create response.
+    assert.equal(store.getApprovalCallback(approvalId).state, 'failed');
+    assert.equal(store.bindApprovalCallback(approvalId, nonce, callbackSid), false);
+    assert.equal(store.verifyApprovalCallbackPin(approvalId, callbackSid), false);
+    assert.equal(store.recordApprovalCallEnd({ ...status, callSid: `CA${'d'.repeat(32)}` }), false);
+    assert.equal(store.recordApprovalCallEnd(status), false);
+    assert.equal(store.getApproval(approvalId).state, 'pending', 'call completion never decides the protected action');
+    assert.equal(store.getTask(taskId).state, 'waiting_human');
+    assert.equal(store.listAudit(sessionId).filter(row => row.type === 'callback.ended').length, 1);
+  });
+});
+
 test('event IDs dedupe atomically and roll back on failure', () => {
   withMemoryStore((store) => {
     const event = { eventId: randomUUID(), machineId: randomUUID(), type: 'agent.progress' };
@@ -160,4 +195,43 @@ test('database URL is restricted to a local file', () => {
   assert.equal(databasePathFromUrl(':memory:'), ':memory:');
   assert.throws(() => databasePathFromUrl('https://example.com/db'), /file:/);
   assert.throws(() => databasePathFromUrl('file://remote/share'), /local file/);
+});
+
+test('reconnect fails only lost pre-connection runs and expires their pending approvals', () => {
+  withMemoryStore(store => {
+    const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
+    const machineId = randomUUID();
+    const agentId = randomUUID();
+    store.ensureMachine({ machineId, userId: user.id, tokenHash: '0'.repeat(64) });
+    const { sessionId } = store.startInboundCall({ userId: user.id, callSid, phoneNumber });
+    store.assignSessionAgent(sessionId, machineId, agentId);
+    const newRun = () => {
+      const taskId = store.createTask({ sessionId, prompt: 'Inspect demo' });
+      const runId = store.createRun({ taskId, agentId });
+      store.transitionTask(taskId, 'running');
+      store.transitionRun(runId, 'running');
+      return { taskId, runId };
+    };
+    const lost = newRun();
+    const alive = newRun();
+    const completed = newRun();
+    store.transitionTask(lost.taskId, 'waiting_human');
+    store.transitionRun(lost.runId, 'waiting_human');
+    const approvalId = store.createApproval({ runId: lost.runId, actionDigest: 'e'.repeat(64),
+      command: 'git push origin phone-demo', cwd: '/demo', expiresAt: Date.now() + 60000 });
+    const candidates = store.unfinishedRunsForMachine(machineId).map(run => run.runId);
+    const fresh = newRun(); // Dispatched after registration; not in the snapshot candidates.
+    store.setTaskResult(completed.taskId, 'Already complete.');
+    store.transitionTask(completed.taskId, 'completed');
+    store.transitionRun(completed.runId, 'completed'); // Replayed final event arrives before snapshot.
+    const interrupted = store.reconcileMachineRuns(machineId, [alive.runId], candidates);
+    assert.deepEqual(interrupted.map(run => run.runId), [lost.runId]);
+    assert.equal(store.getTask(lost.taskId).state, 'failed');
+    assert.match(store.getTask(lost.taskId).result_text, /uncertain/);
+    assert.equal(store.getApproval(approvalId).state, 'expired');
+    assert.equal(store.getTask(alive.taskId).state, 'running');
+    assert.equal(store.getTask(fresh.taskId).state, 'running');
+    assert.equal(store.getTask(completed.taskId).result_text, 'Already complete.');
+    assert.deepEqual(store.reconcileMachineRuns(machineId, [alive.runId], candidates), []);
+  });
 });

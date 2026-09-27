@@ -2,6 +2,7 @@ import { createDaemonClient } from './client.mjs';
 import { createFakeAgent, FAKE_AGENT_ID } from './fake-agent.mjs';
 import { createCodexAgent, CODEX_AGENT_ID } from './codex-agent.mjs';
 import { createManagementServer } from './management.mjs';
+import { randomUUID } from 'node:crypto';
 
 const port = Number(process.env.DAEMON_PORT ?? 3210);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('DAEMON_PORT must be an integer from 1 to 65535');
@@ -19,12 +20,15 @@ const client = createDaemonClient({
   name: process.env.DAEMON_NAME ?? 'Local machine',
   agents,
   onEvent: (event) => {
-    if (event.agentId === CODEX_AGENT_ID || (event.type === 'task.cancel' && codexEnabled)) codexAgent?.receive(event);
-    else fakeAgent.receive(event);
+    if (!codexAgent?.receive(event)) fakeAgent.receive(event);
   },
   onStatus: (state) => {
     console.log(`Daemon connection: ${state}`);
-    if (state === 'online') { fakeAgent.flush(); codexAgent?.flush(); }
+    if (state === 'online') {
+      fakeAgent.flush(); codexAgent?.flush();
+      client.send({ v: 1, eventId: randomUUID(), machineId: process.env.DAEMON_MACHINE_ID,
+        type: 'machine.reconcile', activeRunIds: [...fakeAgent.activeRunIds(), ...(codexAgent?.activeRunIds() ?? [])] });
+    }
   },
   onError: (message) => console.error(message),
 });
@@ -34,6 +38,7 @@ if (codexEnabled) codexAgent = createCodexAgent({
   workspace: process.env.CODEX_WORKSPACE, command: process.env.CODEX_COMMAND ?? 'codex',
   model: process.env.CODEX_MODEL_DEFAULT ?? 'gpt-6-sol',
   allowFullRead: process.env.CODEX_ALLOW_FULL_READ === 'true',
+  approvalCommand: process.env.CODEX_APPROVAL_COMMAND || undefined,
 });
 const management = createManagementServer(client);
 
