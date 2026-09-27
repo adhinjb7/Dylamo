@@ -2,37 +2,46 @@
 
 ## Goal
 
-Build a small, read-only web page that lets the demo operator see whether the phone-to-agent system is working: recent calls, tasks, run outcomes, and paired-machine status. This is for a local hackathon demo, **not** a public admin product. It must remain useful even while Ryan changes the live voice flow.
+Build a small, read-only dashboard for the local demo. Show recent calls, tasks, outcomes, and paired-machine status; keep it independent of live voice-flow changes.
 
-## Ownership and non-goals
+## Scope
 
-- Create files only under `apps/operator-dashboard/**`. You may read `apps/voice-webhook/src/state.mjs` to understand the existing SQLite schema and `apps/daemon/src/management.mjs` to understand the optional daemon health response.
-- Do not edit, import private internals from, or alter the voice server, daemon, shared protocol, root scripts, lockfile, or their tests. Do not run migrations against the live database.
-- Do not add Twilio, OpenAI, GitHub, or ngrok integrations. Do not add login, public hosting, callbacks, task control, approvals, or any write action.
-- Prefer Node built-ins and static HTML/CSS/JavaScript so this work needs no root dependency or lockfile changes.
+- Write only under **apps/operator-dashboard/**. You may read **apps/voice-webhook/src/state.mjs** for SQLite and **apps/daemon/src/management.mjs** for optional health data.
+- Do not edit the voice server, daemon, protocol, root scripts, lockfile, or their tests. Do not migrate the live database.
+- Use built-ins and static HTML/CSS/JavaScript. Add no Twilio, OpenAI, GitHub, or tunnel integration; no login, hosting, callbacks, controls, approvals, or writes.
 
-## Required behavior
+## Requirements
 
-1. Provide `apps/operator-dashboard/src/server.mjs`, runnable with Node 22.13+ as `node apps/operator-dashboard/src/server.mjs --db <absolute-path-to-agent-phone.db>`. The database argument is required; do not silently create a new database. Fail with a helpful error if it is missing, unreadable, or lacks expected tables. Open it read-only. Bind HTTP to `127.0.0.1` only, on port `3330` by default. If the port is taken, fail clearly rather than selecting a public interface.
-2. Serve a single-page local dashboard and `GET /api/snapshot`. The snapshot must contain only an allowlisted, redacted view: machine names and online/offline state; recent call state and timestamps; recent task/run state, elapsed time, short display IDs, and whether a Codex thread/turn was recorded. The browser must not receive phone numbers, PIN hashes, tokens, callback nonces, full prompts, raw Codex messages, approval commands, or database paths. Do not expose a generic SQL endpoint.
-3. Show at least four clear cards/sections: machine connectivity, calls today, tasks by state, and a recent activity timeline. Show "No data yet" states. Refresh automatically every 2–5 seconds without a page reload. A disconnected or unavailable database should show a visible error, not an empty success state.
-4. Use parameterized, bounded queries (`LIMIT` on recent lists), handle nulls and SQLite WAL concurrency, and keep the database handle read-only. If the optional daemon `/health` is included, call only a configurable loopback URL; label its result separately from persisted machine state and do not make the page fail when the daemon is offline.
-5. Make the UI legible on a laptop projector and at 1280px and phone widths. State labels must use text as well as color. Avoid charts or animation that obscure failures. No external CDN or analytics requests.
+1. Provide **apps/operator-dashboard/src/server.mjs**, runnable with Node 22.13+:
 
-## Security and privacy acceptance criteria
+   ~~~sh
+   node apps/operator-dashboard/src/server.mjs --db <absolute-path-to-agent-phone.db>
+   ~~~
 
-- Requests to non-loopback bind addresses are impossible through the CLI. Do not tunnel this dashboard.
-- A fixture containing a fake phone number, PIN hash, token, prompt, and approval command must not expose any of those strings in `/api/snapshot` or the HTML response.
-- Only `GET` and `HEAD` routes needed for the dashboard work; mutation requests return 404 or 405. Set `Cache-Control: no-store` on JSON. Never print database contents in startup/errors.
-- The dashboard must never modify an existing database; tests should prove records are unchanged after requests.
+   Require an existing readable database with expected tables and open it read-only. Bind only 127.0.0.1:3330 by default. Fail clearly for a missing or invalid database and for an occupied port.
 
-## Deliverables and tests
+2. Serve one local page and GET /api/snapshot. Return only redacted, allowlisted data: machine names and connectivity; recent call state and timestamps; recent task/run state, elapsed time, short display IDs, and whether a Codex thread or turn exists. Never return phone numbers, PIN hashes, tokens, callback nonces, prompts, raw Codex messages, approval commands, database paths, or generic SQL.
 
-- `apps/operator-dashboard/src/server.mjs` plus any static assets under that folder.
-- `apps/operator-dashboard/test/dashboard.test.mjs`: use a temporary SQLite fixture with the minimum current schema; verify redaction, empty state, populated state, bounded output, read-only behavior, bad database handling, and loopback binding. Tests must not need Twilio, OpenAI, ngrok, or a real `.env`.
-- `apps/operator-dashboard/README.md`: startup command, what data is displayed/hidden, and a screenshot or concise visual description. Never include real caller data.
-- Demonstrate `node --test apps/operator-dashboard/test/dashboard.test.mjs` and root `npm test` passing. If the existing schema changes before merge, update only your adapter and tests inside your owned folder.
+3. Show machine connectivity, calls today, tasks by state, and recent activity. Include **No data yet**, refresh every 2–5 seconds, and show a visible database error.
 
-## Suggested PR description
+4. Use bounded parameterized queries and a read-only handle that tolerates SQLite WAL concurrency. An optional daemon health probe may call only a configurable loopback URL, must be labeled separately from persisted state, and must not break the page when offline.
 
-Explain what the operator can see, how you verified read-only/redaction guarantees, screenshots using fake fixture data, test results, and any proposed cross-component changes (do not implement those changes in this PR).
+5. Make the page legible on a laptop projector, 1280px screen, and phone width. Use text with color for state and avoid external CDN, analytics, charts, or failure-hiding animation.
+
+## Acceptance criteria
+
+- The CLI cannot bind to non-loopback addresses, and the dashboard is never tunneled.
+- A fake phone number, PIN hash, token, prompt, and approval command never appear in /api/snapshot or HTML.
+- Only needed GET and HEAD routes exist; mutations return 404 or 405. JSON uses Cache-Control: no-store, and startup/errors never print database contents.
+- Requests never modify the database; tests prove records remain unchanged.
+
+## Deliverables
+
+- Server and static assets under **apps/operator-dashboard/**.
+- **apps/operator-dashboard/test/dashboard.test.mjs** with a temporary minimum-schema SQLite fixture. Cover redaction, empty and populated data, bounded output, read-only behavior, bad databases, and loopback binding without Twilio, OpenAI, tunnel, or real .env.
+- **apps/operator-dashboard/README.md** with startup, displayed and hidden data, and a screenshot or concise visual description using fake data.
+- Demonstrate the assignment test and root npm test. If the shared schema changes, update only this folder.
+
+## PR description
+
+State what the operator can see, how read-only and redaction behavior was verified, test results, fake-data screenshots, and any proposed cross-component integration.
