@@ -18,9 +18,18 @@ test('only standalone status questions are handled as status requests', () => {
   }
 });
 
+test('standalone acknowledgments do not become tasks after removing read-back', () => {
+  for (const transcript of ['Yes.', 'Yes, that’s correct.', 'Yes, start it.', 'No.', 'Okay', 'Sure',
+    'Yes. Yes!', 'Yes, stop it.', 'Yes, steer it.', 'No, keep working.', 'Yes connect.']) {
+    assert.equal(localReplyForTranscript(transcript), 'Ready for your next request.', transcript);
+  }
+});
+
 test('substantive questions are never swallowed by the greeting handler', () => {
   for (const transcript of ['Hi, summarize this repo', 'Hello. What packages are installed?',
-    'Can you hear me and inspect package.json?', 'Thanks, what did you find?', '']) {
+    'Can you hear me and inspect package.json?', 'Thanks, what did you find?',
+    'Yes, investigate the failing tests.', 'No changes, just summarize the repo.', 'Run the demo push.',
+    'Correct the headline.', 'Confirm which tests passed.', '']) {
     assert.equal(localReplyForTranscript(transcript), null);
   }
 });

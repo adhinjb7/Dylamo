@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
-// Protocol fixture only: never launches Codex, Git, or a model. The integration
-// test still uses the production adapter, daemon transport, store and webhooks.
-export function stubCodexProcess({ command, cwd, decisions, requests = [] }) {
+// Protocol fixture only: never launches Codex or a model. A test may provide a
+// synchronous fixture-only action to execute after the exact accept decision.
+export function stubCodexProcess({ command, cwd, decisions, requests = [], onAccept = () => {},
+  additionalPermissions = { network: { enabled: true } } }) {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
@@ -32,12 +33,19 @@ export function stubCodexProcess({ command, cwd, decisions, requests = [] }) {
           reply({ id: message.id, result: { turn: { id: 'test-turn' } } });
           setImmediate(() => reply({ id: 'approval-rpc', method: 'item/commandExecution/requestApproval', params: {
             threadId: 'test-thread', turnId: 'test-turn', itemId: 'push-item', command, cwd,
-            availableDecisions: ['accept', 'decline', 'cancel'], additionalPermissions: { network: { enabled: true } },
+            availableDecisions: ['accept', 'decline', 'cancel'], additionalPermissions,
           } }));
         }
         if (message.id === 'approval-rpc' && message.result) {
           decisions.push(message.result.decision);
           if (message.result.decision === 'accept') {
+            try { onAccept(); }
+            catch {
+              reply({ method: 'item/completed', params: { threadId: 'test-thread', turnId: 'test-turn',
+                item: { id: 'push-item', type: 'commandExecution', status: 'failed', exitCode: 1 } } });
+              reply({ method: 'turn/completed', params: { threadId: 'test-thread', turn: { id: 'test-turn', status: 'failed' } } });
+              return;
+            }
             reply({ method: 'item/completed', params: { threadId: 'test-thread', turnId: 'test-turn',
               item: { id: 'push-item', type: 'commandExecution', status: 'completed', exitCode: 0 } } });
             reply({ method: 'item/completed', params: { threadId: 'test-thread', turnId: 'test-turn',

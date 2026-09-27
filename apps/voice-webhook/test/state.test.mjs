@@ -23,6 +23,13 @@ test('file-backed calls and lockout survive reopen', () => {
     const user = first.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
     const { sessionId } = first.startInboundCall({ userId: user.id, callSid, phoneNumber });
     assert.ok(sessionId);
+    const taskId = first.createTask({ sessionId, prompt: 'Run the demo push.' });
+    const runId = first.createRun({ taskId, agentId: randomUUID() });
+    const approvalId = first.createApproval({ runId, actionDigest: 'a'.repeat(64),
+      command: 'git push origin HEAD:refs/heads/phone-demo', cwd: '/fixture', expiresAt: Date.now() + 60000 });
+    first.audit(sessionId, 'approval.required', { approvalId: randomUUID(), actionKind: 'local-demo-push' });
+    assert.equal(first.getApprovalContext(approvalId).action_kind, null, 'another approval cannot supply this description');
+    first.audit(sessionId, 'approval.required', { approvalId, actionKind: 'local-demo-push' });
     assert.equal(first.startInboundCall({ userId: user.id, callSid, phoneNumber }).sessionId, sessionId);
     assert.equal(first.recordAuthFailure(phoneNumber), false);
     assert.equal(first.recordAuthFailure(phoneNumber), false);
@@ -33,6 +40,9 @@ test('file-backed calls and lockout survive reopen', () => {
     try {
       assert.equal(second.getCall(callSid).session_id, sessionId);
       assert.equal(second.isAuthLocked(phoneNumber), true);
+      assert.equal(second.getApprovalContext(approvalId).action_kind, 'local-demo-push',
+        'fixed description metadata survives restart without a new database column');
+      assert.equal(second.getApprovalContext(approvalId).action_digest, 'a'.repeat(64));
       const recovered = second.recoverAfterRestart();
       assert.equal(recovered.calls, 1);
       assert.equal(second.getCall(callSid).state, 'ended');
@@ -91,6 +101,29 @@ test('task and run states persist independently of a call ending', () => {
   });
 });
 
+test('latest task lookup is scoped to the authenticated user and survives hangup', () => {
+  withMemoryStore((store) => {
+    const first = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
+    const second = store.ensureUser({ phoneNumber: '+15065550999', pinHash: 'scrypt:test' });
+    const machineId = randomUUID();
+    store.ensureMachine({ machineId, userId: first.id, tokenHash: 'test-token-hash' });
+    store.setMachineStatus(machineId, 'online');
+    const { sessionId } = store.startInboundCall({ userId: first.id, callSid, phoneNumber });
+    store.assignSessionAgent(sessionId, machineId, randomUUID());
+    const older = store.createTask({ sessionId, prompt: 'Old task' });
+    const newest = store.createTask({ sessionId, prompt: 'Current task' });
+    store.transitionTask(newest, 'running');
+    store.setCallState(callSid, 'streaming');
+    store.setCallState(callSid, 'ended', 'caller_hung_up');
+    const otherSession = store.startInboundCall({ userId: second.id, callSid: `CA${'2'.repeat(32)}`, phoneNumber: second.phoneNumber }).sessionId;
+    const otherTask = store.createTask({ sessionId: otherSession, prompt: 'Other user task' });
+    assert.equal(store.getLatestTaskForUser(first.id).id, newest);
+    assert.equal(store.getLatestTaskForUser(first.id).machine_status, 'online');
+    assert.equal(store.getLatestTaskForUser(second.id).id, otherTask);
+    assert.notEqual(store.getLatestTaskForUser(first.id).id, older);
+  }, () => 1_000);
+});
+
 test('Codex thread and turn IDs are stored once on the assigned run', () => {
   withMemoryStore((store) => {
     const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
@@ -146,6 +179,45 @@ test('expired approval cannot be approved', () => {
   }, () => time);
 });
 
+test('same-call decisions require the exact live inbound call and its prior PIN authentication', () => {
+  for (const variant of ['valid', 'unauthenticated', 'ended', 'other-call', 'callback-planned', 'expired']) {
+    let time = 1_000;
+    withMemoryStore(store => {
+      const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
+      const { sessionId } = store.startInboundCall({ userId: user.id, callSid, phoneNumber });
+      const taskId = store.createTask({ sessionId, prompt: 'Demo push' });
+      const runId = store.createRun({ taskId, agentId: randomUUID() });
+      store.transitionTask(taskId, 'running');
+      store.transitionRun(runId, 'running');
+      store.transitionTask(taskId, 'waiting_human');
+      store.transitionRun(runId, 'waiting_human');
+      store.setCallState(callSid, 'streaming');
+      const actionDigest = 'c'.repeat(64);
+      const approvalId = store.createApproval({ runId, actionDigest, command: 'push', cwd: '/demo', expiresAt: 2_000 });
+      if (variant !== 'unauthenticated') store.audit(sessionId, 'call.authenticated', { callSid });
+      if (variant === 'ended') store.setCallState(callSid, 'ended', 'hangup');
+      if (variant === 'other-call') {
+        const otherCallSid = `CA${'9'.repeat(32)}`;
+        const other = store.startInboundCall({ userId: user.id, callSid: otherCallSid, phoneNumber });
+        store.setCallState(otherCallSid, 'streaming');
+        store.audit(other.sessionId, 'call.authenticated', { callSid: otherCallSid });
+      }
+      if (variant === 'callback-planned') store.prepareApprovalCallback(approvalId);
+      if (variant === 'expired') time = 2_001;
+      const decision = { approvalId, runId, actionDigest, userId: user.id, approved: true,
+        inboundCallSid: variant === 'other-call' ? `CA${'9'.repeat(32)}` : callSid };
+      assert.equal(store.decideApproval(decision), variant === 'valid', variant);
+      if (variant === 'valid') {
+        assert.equal(store.decideApproval(decision), false, 'one-use decision');
+        const audit = store.listAudit(sessionId).find(e => e.type === 'approval.decided');
+        assert.equal(JSON.parse(audit.payload).channel, 'inbound');
+        assert.equal(JSON.parse(audit.payload).callSid, callSid);
+        assert.equal(store.getApprovalCallback(approvalId), undefined);
+      }
+    }, () => time);
+  }
+});
+
 test('callback status is bound to its nonce and SID and cannot reopen after a late REST reply', () => {
   withMemoryStore(store => {
     const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
@@ -195,6 +267,20 @@ test('database URL is restricted to a local file', () => {
   assert.equal(databasePathFromUrl(':memory:'), ':memory:');
   assert.throws(() => databasePathFromUrl('https://example.com/db'), /file:/);
   assert.throws(() => databasePathFromUrl('file://remote/share'), /local file/);
+});
+
+test('a session cannot switch to another agent on the same machine', () => {
+  withMemoryStore(store => {
+    const user = store.ensureUser({ phoneNumber, pinHash: 'scrypt:test' });
+    const machineId = randomUUID();
+    const agentId = randomUUID();
+    store.ensureMachine({ machineId, userId: user.id, tokenHash: '0'.repeat(64) });
+    const { sessionId } = store.startInboundCall({ userId: user.id, callSid, phoneNumber });
+    store.assignSessionAgent(sessionId, machineId, agentId);
+    assert.doesNotThrow(() => store.assignSessionAgent(sessionId, machineId, agentId));
+    assert.throws(() => store.assignSessionAgent(sessionId, machineId, randomUUID()), /cannot be assigned/);
+    assert.equal(store.getSession(sessionId).agent_id, agentId);
+  });
 });
 
 test('reconnect fails only lost pre-connection runs and expires their pending approvals', () => {

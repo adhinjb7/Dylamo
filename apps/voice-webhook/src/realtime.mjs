@@ -173,7 +173,7 @@ export function connectRealtime({ twilio, streamSid, apiKey, controlled = false,
     if (event.type === 'input_audio_buffer.speech_started') {
       callerSpeaking = true;
       interruptSpeech();
-      onSpeechStart();
+      onSpeechStart(event.item_id);
     }
     if (event.type === 'input_audio_buffer.speech_stopped') {
       callerSpeaking = false;

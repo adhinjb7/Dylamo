@@ -46,6 +46,28 @@ test('fake agent holds events while disconnected and flushes on reconnect', () =
   } finally { agent.stop(); }
 });
 
+test('fake agent cancellation stops its timer and cannot complete later', () => {
+  const sent = [];
+  let timerCleared = false;
+  const machineId = randomUUID();
+  const agent = createFakeAgent({ machineId, send: event => { sent.push(event); return true; },
+    setTimer: () => 1, clearTimer: () => { timerCleared = true; } });
+  try {
+    const start = { type: 'task.start', agentId: FAKE_AGENT_ID,
+      sessionId: randomUUID(), taskId: randomUUID(), runId: randomUUID(), prompt: 'Inspect demo' };
+    assert.equal(agent.receive(start), true);
+    const cancel = { type: 'task.cancel', machineId, sessionId: start.sessionId, taskId: start.taskId, runId: start.runId };
+    assert.equal(agent.receive({ ...cancel, taskId: randomUUID() }), false);
+    assert.equal(agent.receive(cancel), true);
+    assert.equal(timerCleared, true);
+    assert.equal(sent.at(-1).type, 'task.cancelled');
+    assert.equal(agent.receive(cancel), false);
+    assert.equal(agent.activeRunIds().length, 0);
+    // The scheduled callback is cleared in production; no completion event was emitted.
+    assert.equal(sent.some(event => event.type === 'task.completed'), false);
+  } finally { agent.stop(); }
+});
+
 test('fake protected action requires an exact, one-shot approval', () => {
   const sent = [];
   const timers = [];

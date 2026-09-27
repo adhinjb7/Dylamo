@@ -7,7 +7,8 @@ export const CODEX_CHECK_REPLY = 'Codex is ready.';
 
 // No generation by default. runModel explicitly opts into a single short turn.
 export function checkCodex({ command = 'codex', options, runModel = false,
-  spawnProcess = spawn, log = console.log, timeoutMs = runModel ? 90_000 : 30_000 }) {
+  spawnProcess = spawn, log = console.log, environment = process.env,
+  timeoutMs = runModel ? 90_000 : 30_000 }) {
   return new Promise((resolve) => {
     let child;
     let lines;
@@ -73,15 +74,15 @@ export function checkCodex({ command = 'codex', options, runModel = false,
       } else if (message.id === 4) {
         if (message.error) { fail('thread/start', message.error); return; }
         if (!hasExpectedCodexPermissions(message.result, options) || typeof message.result?.thread?.id !== 'string') {
-          finish('FAIL: Codex did not confirm a session with the required read-only permissions.', 1);
+          finish('FAIL: Codex did not confirm a session with the required permissions.', 1);
           return;
         }
         if (!runModel) {
-          finish('PASS: Codex created a session with the required read-only profile. No model turn was started.', 0);
+          finish('PASS: Codex created a session with the required permissions profile. No model turn was started.', 0);
           return;
         }
         threadId = message.result.thread.id;
-        log('PASS: read-only session. Testing a short model reply now...');
+        log('PASS: requested permissions profile. Testing a short model reply now...');
         request(5, 'turn/start', createCodexTurnOptions(options, threadId,
           `Reply with exactly: ${CODEX_CHECK_REPLY} Do not use any tools, inspect files, or make changes.`));
       } else if (message.id === 5) {
@@ -116,7 +117,8 @@ export function checkCodex({ command = 'codex', options, runModel = false,
     log(runModel ? 'Checking Codex including one short model turn (uses Codex quota; no phone call)...'
       : 'Checking Codex startup (no model turn or phone call)...');
     try {
-      child = spawnProcess(command, ['app-server'], { cwd: options.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawnProcess(command, ['app-server'], { cwd: options.cwd, env: environment,
+        windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
       child.on('error', (error) => fail('Codex launch', error));
       child.stdin.on('error', (error) => fail('Codex communication', error));
       // Drain stderr without exposing arbitrary headers, file contents, or tokens.

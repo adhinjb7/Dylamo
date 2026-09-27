@@ -78,7 +78,7 @@ test('signed allowlisted call prompts for PIN, then grants access', async () => 
     const first = await signedPost('/voice', params);
     assert.equal(first.status, 200);
     const prompt = await first.text();
-    assert.match(prompt, /<Gather input="dtmf" numDigits="4"/);
+    assert.match(prompt, /<Gather input="dtmf speech" numDigits="4"/);
     assert.match(prompt, /action="https:\/\/example\.ngrok\.app\/voice\/pin"/);
     assert.doesNotMatch(prompt, /Access granted/);
 
@@ -88,6 +88,21 @@ test('signed allowlisted call prompts for PIN, then grants access', async () => 
     assert.match(body, /Access granted/);
     assert.match(body, /<Connect><Stream url="wss:\/\/example\.ngrok\.app\/media">/);
     assert.match(body, /<Parameter name="token" value="[0-9a-f]{48}"/);
+  });
+});
+
+test('spoken PIN uses the same signed authentication path without echoing the code', async () => {
+  await withServer(async ({ signedPost }) => {
+    const params = callParams(81);
+    await signedPost('/voice', params);
+    const unsigned = await signedPost('/voice/pin', { ...params, SpeechResult: 'one two three four' }, false);
+    assert.equal(unsigned.status, 403);
+    const incorrect = await signedPost('/voice/pin', { ...params, SpeechResult: 'one two three five' });
+    assert.match(await incorrect.text(), /Incorrect code/);
+    const verified = await signedPost('/voice/pin', { ...params, SpeechResult: 'one two three four' });
+    const body = await verified.text();
+    assert.match(body, /Access granted/);
+    assert.doesNotMatch(body, /one two three four|1234/);
   });
 });
 
@@ -186,12 +201,13 @@ test('PIN callback without a matching call is denied', async () => {
   });
 });
 
-test('three incorrect PINs lock the caller across calls', async () => {
+test('three incorrect spoken or keypad PINs share the lockout across calls', async () => {
   await withServer(async ({ signedPost }) => {
     const params = callParams(4);
     await signedPost('/voice', params);
     for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const response = await signedPost('/voice/pin', { ...params, Digits: '9999' });
+      const input = attempt % 2 === 0 ? { SpeechResult: 'nine nine nine nine' } : { Digits: '9999' };
+      const response = await signedPost('/voice/pin', { ...params, ...input });
       const body = await response.text();
       assert.doesNotMatch(body, /Access granted/);
       if (attempt === 3) assert.match(body, /Too many attempts/);

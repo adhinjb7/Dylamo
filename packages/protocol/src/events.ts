@@ -38,9 +38,11 @@ export const DaemonEvent = z.discriminatedUnion('type', [
   z.strictObject({ ...common, ...run, type: z.literal('agent.progress'), text: z.string().min(1).max(2000) }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.message'), text: z.string().min(1).max(4000) }),
   z.strictObject({ ...common, ...run, type: z.literal('human_needed'), reason: z.string().min(1).max(1000) }),
-  z.strictObject({ ...common, ...run, type: z.literal('approval.required'), approvalId: InternalId, actionDigest: z.string().regex(/^[a-f0-9]{64}$/), command: z.string().min(1).max(2000), cwd: z.string().min(1).max(1000), expiresAt: z.iso.datetime(), runtime: ApprovalRuntime.optional(), permissionScope: z.string().max(4000).optional() }),
+  z.strictObject({ ...common, ...run, type: z.literal('approval.required'), approvalId: InternalId, actionDigest: z.string().regex(/^[a-f0-9]{64}$/), command: z.string().min(1).max(2000), cwd: z.string().min(1).max(1000), expiresAt: z.iso.datetime(), runtime: ApprovalRuntime.optional(), permissionScope: z.string().max(4000).optional(), actionKind: z.literal('local-demo-push').optional() }),
   z.strictObject({ ...common, ...run, type: z.literal('task.completed'), summary: z.string().min(1).max(4000) }),
   z.strictObject({ ...common, ...run, type: z.literal('task.failed'), reason: z.string().min(1).max(2000) }),
+  z.strictObject({ ...common, ...run, type: z.literal('task.cancelled'), reason: z.string().min(1).max(2000) }),
+  z.strictObject({ ...common, ...run, type: z.literal('task.steer.result'), requestEventId: InternalId, accepted: z.boolean() }),
 ]);
 
 // Server -> daemon. The daemon must still check the exact pending approval
@@ -51,6 +53,7 @@ export const ServerEvent = z.discriminatedUnion('type', [
   z.strictObject({ ...common, ...run, type: z.literal('task.start'), agentId: InternalId, prompt: z.string().min(1).max(10000), codexThreadId: z.string().min(1).max(200).optional(), scenario: z.enum(['basic', 'approval']).optional() }),
   z.strictObject({ ...common, ...run, type: z.literal('agent.message'), text: z.string().min(1).max(4000) }),
   z.strictObject({ ...common, ...run, type: z.literal('task.cancel') }),
+  z.strictObject({ ...common, ...run, type: z.literal('task.steer'), prompt: z.string().min(1).max(600) }),
   z.strictObject({ ...common, ...run, type: z.literal('approval.response'), approvalId: InternalId, actionDigest: z.string().regex(/^[a-f0-9]{64}$/), approved: z.boolean() }),
 ]);
 

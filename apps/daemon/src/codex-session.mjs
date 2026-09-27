@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { mkdirSync, realpathSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 
 export const CODEX_INITIALIZE_PARAMS = {
   clientInfo: { name: 'hack_atlantic', title: 'Hack Atlantic daemon', version: '0.0.1' },
@@ -13,6 +14,37 @@ export const CODEX_ACCOUNT_PARAMS = { refreshToken: false };
 // approvals unless the opt-in exact-action phone bridge is enabled. This policy
 // alone does not grant writes, network, or escalation.
 const CODEX_APPROVAL_POLICY = 'on-request';
+const CODEX_WORKSPACE_TEMP_NAME = '.dylamo-tmp';
+
+export function prepareCodexWorkspaceTemp(cwd) {
+  const workspace = realpathSync(cwd);
+  const candidate = join(workspace, CODEX_WORKSPACE_TEMP_NAME);
+  mkdirSync(candidate, { recursive: true });
+  const actual = realpathSync(candidate);
+  if (relative(workspace, actual).toLowerCase() !== CODEX_WORKSPACE_TEMP_NAME) {
+    throw new Error('The workspace scratch directory must not redirect outside the configured workspace.');
+  }
+  return actual;
+}
+
+export function codexProcessEnvironment({ source = process.env, cwd, allowWorkspaceWrite = false,
+  isolateDemoGit = false }) {
+  const env = { ...source };
+  for (const name of Object.keys(env)) {
+    if (/^(?:TWILIO_|DAEMON_|DEMO_PIN|ALLOWED_CALLER|PUBLIC_BASE_URL)/i.test(name) ||
+        /TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|(?:^|_)KEY(?:$|_)/i.test(name)) delete env[name];
+    // The named local-push rehearsal supplies only these fixture-specific Git
+    // settings. Ambient Git injection must not reach the child app-server.
+    if (isolateDemoGit && /^GIT_/i.test(name) && ![
+      'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_TERMINAL_PROMPT',
+    ].includes(name.toUpperCase())) delete env[name];
+  }
+  if (allowWorkspaceWrite === true) {
+    const scratch = prepareCodexWorkspaceTemp(cwd);
+    env.TMP = scratch; env.TEMP = scratch; env.TMPDIR = scratch;
+  }
+  return env;
+}
 
 export function codexAccountFailure(result) {
   if (typeof result?.requiresOpenaiAuth !== 'boolean') return 'Codex returned an invalid account-readiness result.';
@@ -49,9 +81,28 @@ export function codexFailureDetails(error) {
   return { reason, diagnostic };
 }
 
-export function createCodexSessionOptions({ workspace, model = 'gpt-6-sol', allowFullRead = false }) {
+export function createCodexSessionOptions({ workspace, model = 'gpt-6-sol', allowFullRead = false,
+  allowWorkspaceWrite = false }) {
   if (!workspace) throw new Error('CODEX_WORKSPACE is required for the Codex agent');
   const cwd = resolve(workspace);
+  if (allowWorkspaceWrite === true) {
+    // Opt-in coding mode. Inherit Codex's protected .git/.codex/.agents paths,
+    // permit ordinary workspace edits and local tests, and keep command network
+    // disabled. Secret-bearing .env files remain unreadable.
+    const permissions = `hack_atlantic_edit_${randomUUID().replaceAll('-', '')}`;
+    return {
+      cwd, model, approvalPolicy: CODEX_APPROVAL_POLICY, permissions, serviceName: 'hack_atlantic',
+      config: { permissions: { [permissions]: {
+        extends: ':workspace',
+        filesystem: {
+          ...(allowFullRead === true ? {} : { ':root': 'deny' }),
+          ':minimal': 'read', ':tmpdir': 'read', ':slash_tmp': 'read', glob_scan_max_depth: 4,
+          ':workspace_roots': { '.': 'write', '.env': 'deny', '**/*.env': 'deny' },
+        },
+        network: { enabled: false },
+      } } },
+    };
+  }
   // No temporary profile definition is needed once broad reads are approved.
   if (allowFullRead === true) {
     return { cwd, model, approvalPolicy: CODEX_APPROVAL_POLICY, permissions: ':read-only', serviceName: 'hack_atlantic' };
@@ -67,6 +118,13 @@ export function createCodexSessionOptions({ workspace, model = 'gpt-6-sol', allo
 }
 
 export function hasExpectedCodexPermissions(result, options) {
+  const profile = options.config?.permissions?.[options.permissions];
+  if (profile?.extends === ':workspace') {
+    return result?.activePermissionProfile?.id === options.permissions &&
+      result?.activePermissionProfile?.extends === ':workspace' &&
+      result?.approvalPolicy === CODEX_APPROVAL_POLICY &&
+      result?.sandbox?.type === 'workspaceWrite' && result.sandbox.networkAccess === false;
+  }
   if (result?.activePermissionProfile?.id !== options.permissions ||
       result?.activePermissionProfile?.extends != null || result?.approvalPolicy !== CODEX_APPROVAL_POLICY) return false;
   // Verify effective permissions as well as profile identity for the built-in.

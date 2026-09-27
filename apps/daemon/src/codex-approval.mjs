@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { matchesPendingApproval, PROTOCOL_VERSION } from '@hack-atlantic/protocol';
 import { matchesCodexCommand, describeCodexCommand } from './codex-command.mjs';
+import { DEMO_PUSH_COMMAND } from './codex-task.mjs';
 
 // The operator chooses ONE command for this demo. Matching is deliberately
 // exact; shell fragments, stdin, host-wide network grants and session grants
@@ -68,22 +69,27 @@ export function createCodexApproval({ machineId, workspace, command, now = Date.
     };
   }
 
-  function prepare(run, request) {
+  function prepare(run, request, protectedContext = null) {
     if (rejectionCode(run, request)) return null;
     const p = request.params;
     const requestId = JSON.stringify(request.id);
     const runtime = { threadId: p.threadId, turnId: p.turnId, itemId: p.itemId, requestId };
     const permissionScope = JSON.stringify(p.additionalPermissions ?? null);
+    // Only the daemon's verified local push state earns this fixed description.
+    // Never infer consequences from model prose, a substring or extra grants.
+    const actionKind = protectedContext && command === DEMO_PUSH_COMMAND && p.additionalPermissions == null
+      ? 'local-demo-push' : undefined;
     // Persist and hash the actual full runtime command, including any accepted
     // shell wrapper. Equivalent readable actions must not share an approval
     // digest when their execution representation or permissions differ.
     const runtimeCommand = p.command;
     const actionDigest = createHash('sha256').update(JSON.stringify({ command, runtimeCommand, cwd, runtime,
-      approvalId: p.approvalId ?? null, permissionScope })).digest('hex');
+      approvalId: p.approvalId ?? null, permissionScope, protectedContext, actionKind })).digest('hex');
     return { v: PROTOCOL_VERSION, eventId: randomUUID(), machineId,
       sessionId: run.sessionId, taskId: run.taskId, runId: run.runId,
       type: 'approval.required', approvalId: randomUUID(), actionDigest,
-      command: runtimeCommand, cwd, runtime, permissionScope, expiresAt: new Date(now() + ttlMs).toISOString() };
+      command: runtimeCommand, cwd, runtime, permissionScope, ...(actionKind ? { actionKind } : {}),
+      expiresAt: new Date(now() + ttlMs).toISOString() };
   }
 
   function accepts(pending, response) {

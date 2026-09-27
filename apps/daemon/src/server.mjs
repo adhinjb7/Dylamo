@@ -10,9 +10,11 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('DAEMON
 let fakeAgent;
 let codexAgent;
 const codexEnabled = process.env.CODEX_AGENT_ENABLED === 'true';
+const allowWorkspaceWrite = process.env.CODEX_ALLOW_WORKSPACE_WRITE === 'true';
 if (codexEnabled && !process.env.CODEX_WORKSPACE) throw new Error('CODEX_WORKSPACE is required when CODEX_AGENT_ENABLED=true');
 const agents = [{ agentId: FAKE_AGENT_ID, adapterType: 'fake', name: 'Demo fake agent', status: 'idle' }];
-if (codexEnabled) agents.push({ agentId: CODEX_AGENT_ID, adapterType: 'codex', name: 'Codex read-only agent', status: 'idle' });
+if (codexEnabled) agents.push({ agentId: CODEX_AGENT_ID, adapterType: 'codex',
+  name: allowWorkspaceWrite ? 'Codex workspace agent' : 'Codex read-only agent', status: 'idle' });
 const client = createDaemonClient({
   serverUrl: process.env.DAEMON_SERVER_URL,
   machineId: process.env.DAEMON_MACHINE_ID,
@@ -38,6 +40,7 @@ if (codexEnabled) codexAgent = createCodexAgent({
   workspace: process.env.CODEX_WORKSPACE, command: process.env.CODEX_COMMAND ?? 'codex',
   model: process.env.CODEX_MODEL_DEFAULT ?? 'gpt-6-sol',
   allowFullRead: process.env.CODEX_ALLOW_FULL_READ === 'true',
+  allowWorkspaceWrite,
   approvalCommand: process.env.CODEX_APPROVAL_COMMAND || undefined,
 });
 const management = createManagementServer(client);

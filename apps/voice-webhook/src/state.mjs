@@ -192,8 +192,8 @@ export function openStateStore(path, { now = Date.now } = {}) {
 
   function assignSessionAgent(sessionId, machineId, agentId) {
     const result = db.prepare(`UPDATE sessions SET machine_id=?, agent_id=?, updated_at=?
-      WHERE id=? AND state='active' AND (machine_id IS NULL OR machine_id=?)`)
-      .run(machineId, agentId, now(), sessionId, machineId);
+      WHERE id=? AND state='active' AND (machine_id IS NULL OR (machine_id=? AND agent_id=?))`)
+      .run(machineId, agentId, now(), sessionId, machineId, agentId);
     if (!result.changes) throw new Error('session cannot be assigned to machine');
   }
 
@@ -310,7 +310,7 @@ export function openStateStore(path, { now = Date.now } = {}) {
       WHERE approval_id=? AND call_sid=? AND state='dialed'`).run(approvalId, callSid);
   }
 
-  function decideApproval({ approvalId, runId, actionDigest, userId, approved }) {
+  function decideApproval({ approvalId, runId, actionDigest, userId, approved, inboundCallSid = null }) {
     if (typeof approved !== 'boolean') throw new Error('approval decision must be explicit');
     return transaction(() => {
       const approval = db.prepare(`SELECT a.*, r.state AS run_state, s.user_id AS session_user_id, s.id AS session_id
@@ -319,12 +319,24 @@ export function openStateStore(path, { now = Date.now } = {}) {
         WHERE a.id=?`).get(approvalId);
       if (!approval || approval.state !== 'pending' || approval.run_state !== 'waiting_human' || approval.run_id !== runId ||
           approval.action_digest !== actionDigest || approval.session_user_id !== userId) return false;
+      if (inboundCallSid !== null) {
+        // Same-call consent reuses this call's successful PIN authentication,
+        // not caller ID or another call's authentication. Never race a callback.
+        const authenticatedCall = db.prepare(`SELECT 1 FROM call_attempts c
+          WHERE c.call_sid=? AND c.session_id=? AND c.direction='inbound' AND c.state='streaming'
+          AND EXISTS (SELECT 1 FROM audit_events e WHERE e.session_id=c.session_id
+            AND e.type='call.authenticated' AND json_extract(e.redacted_payload, '$.callSid')=c.call_sid)
+          AND NOT EXISTS (SELECT 1 FROM approval_callbacks WHERE approval_id=?)`)
+          .get(inboundCallSid, approval.session_id, approvalId);
+        if (!authenticatedCall) return false;
+      }
       const next = approval.expires_at <= now() ? 'expired' : (approved === true ? 'approved' : 'rejected');
       if (!canTransitionApproval(approval.state, next)) return false;
       db.prepare('UPDATE approvals SET state=?, resolved_at=?, decided_by_user_id=? WHERE id=?')
         .run(next, now(), userId, approvalId);
       db.prepare(`INSERT INTO audit_events (id, session_id, type, redacted_payload, created_at)
-        VALUES (?, ?, ?, ?, ?)`).run(randomUUID(), approval.session_id, 'approval.decided', JSON.stringify({ approvalId, state: next }), now());
+        VALUES (?, ?, ?, ?, ?)`).run(randomUUID(), approval.session_id, 'approval.decided', JSON.stringify({ approvalId, state: next,
+          ...(inboundCallSid !== null ? { channel: 'inbound', callSid: inboundCallSid } : {}) }), now());
       return next === 'approved';
     });
   }
@@ -394,6 +406,11 @@ export function openStateStore(path, { now = Date.now } = {}) {
     getCall: (callSid) => db.prepare('SELECT * FROM call_attempts WHERE call_sid=?').get(callSid),
     getMachine: (machineId) => db.prepare('SELECT id, name, connection_status AS status, last_seen_at AS lastSeenAt FROM machines WHERE id=?').get(machineId),
     getTask: (taskId) => db.prepare('SELECT * FROM tasks WHERE id=?').get(taskId),
+    getLatestTaskForUser: (userId) => db.prepare(`SELECT t.id, t.session_id, t.state, t.result_text,
+      t.started_at, s.machine_id, m.connection_status AS machine_status
+      FROM tasks t JOIN sessions s ON s.id=t.session_id
+      LEFT JOIN machines m ON m.id=s.machine_id
+      WHERE s.user_id=? ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1`).get(userId),
     listTasksForSession: (sessionId) => db.prepare('SELECT * FROM tasks WHERE session_id=? ORDER BY started_at').all(sessionId),
     getSession: (sessionId) => db.prepare('SELECT * FROM sessions WHERE id=?').get(sessionId),
     getRun: (runId) => db.prepare('SELECT * FROM agent_runs WHERE id=?').get(runId),
@@ -401,7 +418,10 @@ export function openStateStore(path, { now = Date.now } = {}) {
     getApproval: (approvalId) => db.prepare('SELECT * FROM approvals WHERE id=?').get(approvalId),
     hasApprovedApprovalForRun: (runId) => Boolean(db.prepare(`SELECT 1 FROM approvals WHERE run_id=? AND state='approved'
       AND NOT EXISTS (SELECT 1 FROM approvals WHERE run_id=? AND state != 'approved') LIMIT 1`).get(runId, runId)),
-    getApprovalContext: (approvalId) => db.prepare(`SELECT a.*, r.task_id, t.session_id, s.machine_id, s.user_id
+    getApprovalContext: (approvalId) => db.prepare(`SELECT a.*, r.task_id, t.session_id, s.machine_id, s.user_id,
+      (SELECT json_extract(e.redacted_payload, '$.actionKind') FROM audit_events e
+        WHERE e.session_id=t.session_id AND e.type='approval.required'
+        AND json_extract(e.redacted_payload, '$.approvalId')=a.id LIMIT 1) AS action_kind
       FROM approvals a JOIN agent_runs r ON r.id=a.run_id JOIN tasks t ON t.id=r.task_id
       JOIN sessions s ON s.id=t.session_id WHERE a.id=?`).get(approvalId),
     getApprovalCallback: (approvalId) => db.prepare('SELECT * FROM approval_callbacks WHERE approval_id=?').get(approvalId),

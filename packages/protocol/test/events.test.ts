@@ -38,6 +38,22 @@ test('task start may carry a validated Codex continuation thread ID', () => {
   assert.equal(ServerEvent.safeParse({ ...start, codexThreadId: '' }).success, false);
 });
 
+test('a daemon can report a correlated task cancellation', () => {
+  const cancelled = { ...common, ...run, type: 'task.cancelled', reason: 'Stopped by the caller.' };
+  assert.equal(DaemonEvent.safeParse(cancelled).success, true);
+  assert.equal(DaemonEvent.safeParse({ ...cancelled, runId: undefined }).success, false);
+  assert.equal(DaemonEvent.safeParse({ ...cancelled, reason: '' }).success, false);
+});
+
+test('steering carries a bounded prompt and correlates its result to the request', () => {
+  const steer = { ...common, ...run, type: 'task.steer', prompt: 'Focus on failing tests.' };
+  const result = { ...common, ...run, type: 'task.steer.result', requestEventId: eventId, accepted: true };
+  assert.equal(ServerEvent.safeParse(steer).success, true);
+  assert.equal(ServerEvent.safeParse({ ...steer, prompt: 'x'.repeat(601) }).success, false);
+  assert.equal(DaemonEvent.safeParse(result).success, true);
+  assert.equal(DaemonEvent.safeParse({ ...result, requestEventId: undefined }).success, false);
+});
+
 test('approval requests and responses bind to the exact action digest', () => {
   const request = {
     ...common, ...run, type: 'approval.required', approvalId, actionDigest,
@@ -45,6 +61,8 @@ test('approval requests and responses bind to the exact action digest', () => {
   };
   const response = { ...common, ...run, type: 'approval.response', approvalId, actionDigest, approved: true };
   assert.equal(DaemonEvent.safeParse(request).success, true);
+  assert.equal(DaemonEvent.safeParse({ ...request, actionKind: 'local-demo-push' }).success, true);
+  assert.equal(DaemonEvent.safeParse({ ...request, actionKind: 'safe-production-deploy' }).success, false);
   assert.equal(ServerEvent.safeParse(response).success, true);
   assert.equal(ServerEvent.safeParse({ ...response, actionDigest: 'bad' }).success, false);
   assert.equal(ServerEvent.safeParse({ ...response, approved: 'yes' }).success, false);

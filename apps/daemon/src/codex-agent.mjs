@@ -2,21 +2,29 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
 import { PROTOCOL_VERSION } from '@hack-atlantic/protocol';
-import { CODEX_INITIALIZE_PARAMS, CODEX_ACCOUNT_PARAMS, codexAccountFailure, codexFailureDetails, createCodexSessionOptions, createCodexTurnOptions, hasExpectedCodexPermissions } from './codex-session.mjs';
+import { CODEX_INITIALIZE_PARAMS, CODEX_ACCOUNT_PARAMS, codexAccountFailure, codexFailureDetails, codexProcessEnvironment, createCodexSessionOptions, createCodexTurnOptions, hasExpectedCodexPermissions } from './codex-session.mjs';
 import { createCodexApproval } from './codex-approval.mjs';
-import { prepareCodexTask } from './codex-task.mjs';
+import { DEMO_PUSH_COMMAND, prepareCodexTask } from './codex-task.mjs';
+import { DemoPushSafetyError, inspectDemoPush, sameDemoPushState, verifyDemoPushResult } from './git-push-safety.mjs';
 
 export const CODEX_AGENT_ID = '00000000-0000-4000-8000-000000000008';
 const STARTUP_TIMEOUT_MS = 30_000;
 const TURN_TIMEOUT_MS = 10 * 60_000;
 
-// The sandbox stays read-only. The optional approval command is held at the
-// actual app-server RPC boundary until an exact, one-use phone decision arrives.
-export function createCodexAgent({ machineId, send, workspace, command = 'codex', model = 'gpt-6-sol', allowFullRead = false, approvalCommand, approvalTimeoutMs = 300_000, now = Date.now, spawnProcess = spawn, processEnv = process.env, logger = console, onApprovalDiagnostic = () => {} }) {
-  const sessionOptions = createCodexSessionOptions({ workspace, model, allowFullRead });
+// Read-only by default. Opt-in workspace edits do not authorize a protected
+// command, which is still held at the app-server RPC boundary for phone approval.
+export function createCodexAgent({ machineId, send, workspace, command = 'codex', model = 'gpt-6-sol',
+  allowFullRead = false, allowWorkspaceWrite = false, approvalCommand, approvalTimeoutMs = 300_000,
+  now = Date.now, spawnProcess = spawn, processEnv = process.env, logger = console,
+  inspectPushState = inspectDemoPush, verifyPushResult = verifyDemoPushResult,
+  onApprovalDiagnostic = () => {} }) {
+  const sessionOptions = createCodexSessionOptions({ workspace, model, allowFullRead, allowWorkspaceWrite });
   if (approvalCommand) {
     sessionOptions.approvalsReviewer = 'user';
-    sessionOptions.config = { ...sessionOptions.config, features: { apps: false, plugins: false } };
+    // Command network rules do not constrain hosted search or delegated agents.
+    // Keep the phone approval boundary within this one local Codex turn.
+    sessionOptions.config = { ...sessionOptions.config, web_search: 'disabled',
+      features: { apps: false, plugins: false, multi_agent: false } };
   }
   const { cwd } = sessionOptions;
   const runs = new Map();
@@ -76,9 +84,20 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
   function handle(run, message) {
     if (run.finished || !message || typeof message !== 'object') return;
     if (message.id != null && message.method) {
-      const proposal = approvals.prepare(run, message);
+      let proposal = approvals.prepare(run, message);
       if (proposal && !run.approval) {
-        run.approval = { event: proposal, rpcId: message.id, resolved: false };
+        let pushState = null;
+        if (approvalCommand === DEMO_PUSH_COMMAND) {
+          try {
+            pushState = inspectPushState({ workspace: cwd, environment: run.childEnv });
+            proposal = approvals.prepare(run, message, pushState);
+          } catch (error) {
+            try { write(run, { id: message.id, result: { decision: 'decline' } }); } catch {}
+            return finish(run, 'task.failed', { reason: error instanceof DemoPushSafetyError
+              ? error.message : 'Could not verify the demo push state. No action was approved.' });
+          }
+        }
+        run.approval = { event: proposal, rpcId: message.id, resolved: false, pushState };
         run.stage = 'waiting_human';
         clearTimeout(run.timer);
         run.approvalTimer = setTimeout(() => finish(run, 'task.failed', {
@@ -168,7 +187,7 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
       }
       if (!hasExpectedCodexPermissions(message.result, sessionOptions) ||
           (approvals.enabled && message.result.approvalsReviewer !== 'user')) {
-        return finish(run, 'task.failed', { reason: 'Codex did not confirm the required read-only permissions profile.' });
+        return finish(run, 'task.failed', { reason: 'Codex did not confirm the required permissions profile.' });
       }
       run.threadId = threadId;
       run.stage = 'turn/start';
@@ -189,12 +208,26 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
       emit(run, 'agent.started', { codexThreadId: run.threadId, codexTurnId: turnId });
       return;
     }
+    if (run.steerRequests.has(message.id)) {
+      const requestEventId = run.steerRequests.get(message.id);
+      run.steerRequests.delete(message.id);
+      emit(run, 'task.steer.result', {
+        requestEventId, accepted: !message.error && message.result?.turnId === run.turnId,
+      });
+      return;
+    }
     const params = message.params ?? {};
     if (params.threadId && params.threadId !== run.threadId) return;
     if (params.turnId && run.turnId && params.turnId !== run.turnId) return;
     if (message.method === 'serverRequest/resolved' && run.approval && !run.approval.resolved &&
         params.requestId === run.approval.rpcId) {
       return finish(run, 'task.failed', { reason: 'Codex cleared the pending approval. The action was not authorized.' });
+    }
+    if (approvals.enabled && message.method === 'item/started' &&
+        ['mcpToolCall', 'dynamicToolCall', 'collabToolCall', 'webSearch'].includes(params.item?.type)) {
+      return finish(run, 'task.failed', {
+        reason: 'Codex attempted an external or delegated tool in protected-action mode. The task was stopped.',
+      });
     }
     if (message.method === 'item/started' && params.item?.type === 'commandExecution') {
       emit(run, 'agent.progress', { text: 'Codex is checking a repository command.' });
@@ -221,6 +254,14 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
           ? 'The approved command failed. Check the repository before retrying.'
           : 'Codex did not confirm the approved command result. Its outcome is uncertain; check before retrying.' });
       }
+      if (params.turn.status === 'completed' && run.approval?.approved && run.approval.pushState &&
+          run.protectedOutcome === true) {
+        try {
+          verifyPushResult({ workspace: cwd, environment: run.childEnv, expectedState: run.approval.pushState });
+        } catch {
+          return finish(run, 'task.failed', { reason: 'Codex reported a successful push, but the local destination ref could not be verified. Inspect it before retrying.' });
+        }
+      }
       if (params.turn.status !== 'completed' || run.deniedRequest) {
         const failure = params.turn.error ? codexFailureDetails(params.turn.error) : run.lastFailure;
         if (failure) run.diagnostic = failure.diagnostic;
@@ -232,7 +273,9 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
       } else if (run.requiresApproval && !run.approval) {
         finish(run, 'task.failed', { reason: 'The demo push did not reach a verified approval request. No action was authorized.' });
       } else {
-        const summary = run.answer || 'Codex completed the read-only task without a final message.';
+        const summary = run.approval?.approved && run.approval.pushState
+          ? 'Done. The prepared changes are published to the local demo branch.'
+          : run.answer || 'Codex completed the read-only task without a final message.';
         emit(run, 'agent.message', { text: summary });
         finish(run, 'task.completed', { summary });
       }
@@ -243,6 +286,17 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
     if (event.type === 'approval.response') {
       const run = runs.get(event.runId);
       if (!run || !approvals.accepts(run.approval, event)) return false;
+      if (event.approved && run.approval.pushState) {
+        let current;
+        try { current = inspectPushState({ workspace: cwd, environment: run.childEnv }); }
+        catch { current = null; }
+        if (!sameDemoPushState(run.approval.pushState, current)) {
+          run.approval.resolved = true;
+          try { write(run, { id: run.approval.rpcId, result: { decision: 'cancel' } }); } catch {}
+          finish(run, 'task.failed', { reason: 'The demo push commit or destination changed while approval was pending. No action was approved.' });
+          return true;
+        }
+      }
       run.approval.resolved = true;
       run.approval.approved = event.approved;
       clearTimeout(run.approvalTimer);
@@ -262,8 +316,28 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
       }
       return true;
     }
-    if (event.type === 'task.cancel' && runs.has(event.runId)) {
-      finish(runs.get(event.runId), 'task.failed', { reason: 'Codex task was cancelled.' });
+    if (event.type === 'task.cancel') {
+      const run = runs.get(event.runId);
+      if (!run || event.machineId !== machineId || event.sessionId !== run.sessionId || event.taskId !== run.taskId) return false;
+      finish(run, 'task.cancelled', { reason: 'Codex task was cancelled by the caller.' });
+      return true;
+    }
+    if (event.type === 'task.steer') {
+      const run = runs.get(event.runId);
+      if (!run || event.machineId !== machineId || event.sessionId !== run.sessionId ||
+          event.taskId !== run.taskId || typeof event.prompt !== 'string' ||
+          !event.prompt.trim() || event.prompt.length > 600 || !event.eventId) return false;
+      if (run.stage !== 'running' || !run.threadId || !run.turnId || run.approval) {
+        emit(run, 'task.steer.result', { requestEventId: event.eventId, accepted: false });
+        return true;
+      }
+      try {
+        const requestId = request(run, 'turn/steer', { threadId: run.threadId,
+          expectedTurnId: run.turnId, input: [{ type: 'text', text: event.prompt }] });
+        run.steerRequests.set(requestId, event.eventId);
+      } catch {
+        emit(run, 'task.steer.result', { requestEventId: event.eventId, accepted: false });
+      }
       return true;
     }
     if (event.type !== 'task.start' || event.agentId !== CODEX_AGENT_ID || seenRuns.has(event.runId)) return false;
@@ -274,7 +348,8 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
       initializeId: null, threadRequestId: null, turnRequestId: null,
       accountRequestId: null, requirementsRequestId: null, lastFailure: null,
       threadId: null, turnId: null, answer: '', deniedRequest: false, timer: null,
-      stage: 'spawn', diagnostic: null, stderrTail: '', approval: null, approvalTimer: null };
+      stage: 'spawn', diagnostic: null, stderrTail: '', approval: null, approvalTimer: null,
+      childEnv: null, steerRequests: new Map() };
     seenRuns.add(run.runId);
     runs.set(run.runId, run);
     if (task.reason) {
@@ -283,11 +358,13 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
       return true;
     }
     try {
-      const env = { ...processEnv };
-      for (const name of Object.keys(env)) {
-        if (/^(?:TWILIO_|DAEMON_|DEMO_PIN|ALLOWED_CALLER|PUBLIC_BASE_URL|OPENAI_API_KEY)/i.test(name)) delete env[name];
-      }
-      const args = approvals.enabled ? ['-c', 'features.apps=false', '-c', 'features.plugins=false', 'app-server'] : ['app-server'];
+      const env = codexProcessEnvironment({ source: processEnv, cwd, allowWorkspaceWrite,
+        isolateDemoGit: approvalCommand === DEMO_PUSH_COMMAND });
+      run.childEnv = env;
+      const args = approvals.enabled
+        ? ['-c', 'features.apps=false', '-c', 'features.plugins=false', '-c', 'features.multi_agent=false',
+          '-c', 'web_search=disabled', 'app-server']
+        : ['app-server'];
       run.process = spawnProcess(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       const lines = readline.createInterface({ input: run.process.stdout });
       lines.on('line', (line) => {
@@ -316,7 +393,8 @@ export function createCodexAgent({ machineId, send, workspace, command = 'codex'
       run.initializeId = request(run, 'initialize', CODEX_INITIALIZE_PARAMS);
       run.timer = setTimeout(() => finish(run, 'task.failed', { reason: 'Codex app server did not start in time.' }), STARTUP_TIMEOUT_MS);
       run.timer.unref?.();
-      emit(run, 'agent.progress', { text: 'Starting Codex for a read-only repository task.' });
+      emit(run, 'agent.progress', { text: allowWorkspaceWrite
+        ? 'Starting Codex for a workspace task.' : 'Starting Codex for a read-only repository task.' });
     } catch {
       finish(run, 'task.failed', { reason: 'Could not launch Codex app server.' });
     }

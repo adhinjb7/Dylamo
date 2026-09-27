@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { createCodexAgent, CODEX_AGENT_ID } from '../src/codex-agent.mjs';
+import { DemoPushSafetyError } from '../src/git-push-safety.mjs';
 
 function fixture(allowFullRead = false, options = {}) {
   const sent = [];
@@ -27,12 +28,15 @@ function fixture(allowFullRead = false, options = {}) {
   });
   const agent = createCodexAgent({ machineId: randomUUID(), workspace: process.cwd(), allowFullRead,
     send: (event) => { sent.push(event); return true; }, spawnProcess: (...args) => { launches.push(args); return child; },
-    logger: { error: (message) => errors.push(message) }, ...options });
+    logger: { error: (message) => errors.push(message) },
+    inspectPushState: () => ({ head: 'a'.repeat(40), pushUrl: 'fixture-origin', localTarget: null }),
+    verifyPushResult: () => true, ...options });
   const start = { type: 'task.start', agentId: CODEX_AGENT_ID,
     sessionId: randomUUID(), taskId: randomUUID(), runId: randomUUID(), prompt: 'Summarize package.json' };
   const reply = (message) => child.stdout.write(`${JSON.stringify(message)}\n`);
   const tick = () => new Promise((resolve) => setImmediate(resolve));
-  return { agent, sent, requests, errors, child, start, reply, tick, allowFullRead, launches };
+  return { agent, sent, requests, errors, child, start, reply, tick, allowFullRead,
+    allowWorkspaceWrite: options.allowWorkspaceWrite === true, launches };
 }
 
 async function startThread(f, method = 'thread/start') {
@@ -56,6 +60,8 @@ async function startThread(f, method = 'thread/start') {
     await f.tick();
     assert.equal(f.requests.at(-1).params.config.features.apps, false);
     assert.equal(f.requests.at(-1).params.config.features.plugins, false);
+    assert.equal(f.requests.at(-1).params.config.features.multi_agent, false);
+    assert.equal(f.requests.at(-1).params.config.web_search, 'disabled');
     assert.deepEqual(f.requests.at(-1).params.config.mcp_servers.privateService, { enabled: false });
     assert.deepEqual(f.requests.at(-1).params.config.plugins['demo@local'], { enabled: false });
   }
@@ -63,7 +69,12 @@ async function startThread(f, method = 'thread/start') {
   const threadParams = f.requests.at(-1).params;
   assert.equal(threadParams.approvalPolicy, 'on-request');
   assert.equal(threadParams.sandbox, undefined, 'sandbox must not override the named permissions profile');
-  if (f.allowFullRead) {
+  if (f.allowWorkspaceWrite) {
+    const profile = threadParams.config.permissions[threadParams.permissions];
+    assert.equal(profile.extends, ':workspace');
+    assert.equal(profile.filesystem[':workspace_roots']['.'], 'write');
+    assert.equal(profile.network.enabled, false);
+  } else if (f.allowFullRead) {
     assert.equal(threadParams.permissions, ':read-only');
     if (!threadParams.approvalsReviewer) assert.equal(threadParams.config, undefined);
   } else {
@@ -77,9 +88,10 @@ async function startThread(f, method = 'thread/start') {
 async function startTurn(f) {
   const threadParams = await startThread(f);
   f.reply({ id: f.requests.at(-1).id, result: { thread: { id: 'thread-test' },
-    sandbox: { type: 'readOnly', networkAccess: false },
+    sandbox: { type: f.allowWorkspaceWrite ? 'workspaceWrite' : 'readOnly', networkAccess: false },
     approvalsReviewer: 'user',
-    approvalPolicy: 'on-request', activePermissionProfile: { id: threadParams.permissions, extends: null } } });
+    approvalPolicy: 'on-request', activePermissionProfile: { id: threadParams.permissions,
+      extends: f.allowWorkspaceWrite ? ':workspace' : null } } });
   await f.tick();
   assert.equal(f.requests.at(-1).method, 'turn/start');
   assert.equal(f.requests.at(-1).params.approvalPolicy, 'on-request');
@@ -101,6 +113,96 @@ test('Codex app-server read-only run persists IDs and completes with final answe
     assert.equal(f.sent[1].codexThreadId, 'thread-test');
     assert.equal(f.sent[1].codexTurnId, 'turn-test');
     assert.equal(f.sent[3].summary, 'The project has three workspaces.');
+  } finally { f.agent.stop(); }
+});
+
+test('opt-in workspace editing starts with a bounded profile but cannot auto-approve a protected command', async () => {
+  const f = fixture(false, { allowWorkspaceWrite: true });
+  try {
+    await startTurn(f);
+    assert.equal(f.requests.find(request => request.method === 'turn/start').params.permissions,
+      f.requests.find(request => request.method === 'thread/start').params.permissions);
+    f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 'thread-test', turnId: 'turn-test', itemId: 'item-1', command: 'git push', cwd: process.cwd(),
+    } });
+    await f.tick();
+    assert.deepEqual(f.requests.at(-1), { id: 91, result: { decision: 'decline' } });
+    f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.failed');
+  } finally { f.agent.stop(); }
+});
+
+test('protected-action mode stops on an unexpected external or delegated tool item', async () => {
+  for (const type of ['mcpToolCall', 'dynamicToolCall', 'collabToolCall', 'webSearch']) {
+    const f = fixture(true, { approvalCommand: 'git push origin HEAD:refs/heads/phone-demo' });
+    try {
+      await startTurn(f);
+      f.reply({ method: 'item/started', params: { threadId: 'thread-test', turnId: 'turn-test',
+        item: { type, id: 'unexpected-tool' } } });
+      await f.tick();
+      assert.equal(f.sent.at(-1).type, 'task.failed');
+      assert.match(f.sent.at(-1).reason, /external or delegated tool/);
+      assert.equal(f.sent.some(event => event.type === 'task.completed'), false);
+    } finally { f.agent.stop(); }
+  }
+});
+
+test('a correlated cancel stops the Codex run without reporting success', async () => {
+  const f = fixture();
+  try {
+    await startTurn(f);
+    const cancel = { type: 'task.cancel', machineId: f.sent[0].machineId,
+      sessionId: f.start.sessionId, taskId: f.start.taskId, runId: f.start.runId };
+    assert.equal(f.agent.receive({ ...cancel, taskId: randomUUID() }), false);
+    assert.equal(f.agent.receive(cancel), true);
+    assert.equal(f.sent.at(-1).type, 'task.cancelled');
+    assert.equal(f.agent.receive(cancel), false);
+    assert.equal(f.sent.some(event => event.type === 'task.completed'), false);
+  } finally { f.agent.stop(); }
+});
+
+test('steering targets only the active turn and reports the app-server acknowledgment', async () => {
+  const f = fixture();
+  try {
+    await startTurn(f);
+    const steer = { type: 'task.steer', eventId: randomUUID(), machineId: f.sent[0].machineId,
+      sessionId: f.start.sessionId, taskId: f.start.taskId, runId: f.start.runId,
+      prompt: 'Focus on failing tests first.' };
+    assert.equal(f.agent.receive({ ...steer, taskId: randomUUID() }), false);
+    assert.equal(f.agent.receive(steer), true);
+    const request = f.requests.at(-1);
+    assert.equal(request.method, 'turn/steer');
+    assert.deepEqual(request.params, { threadId: 'thread-test', expectedTurnId: 'turn-test',
+      input: [{ type: 'text', text: steer.prompt }] });
+    f.reply({ id: request.id, result: { turnId: 'turn-test' } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.steer.result');
+    assert.equal(f.sent.at(-1).requestEventId, steer.eventId);
+    assert.equal(f.sent.at(-1).accepted, true);
+
+    const changed = { ...steer, eventId: randomUUID(), prompt: 'Check the README first.' };
+    assert.equal(f.agent.receive(changed), true);
+    f.reply({ id: f.requests.at(-1).id, result: { turnId: 'other-turn' } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).accepted, false, 'a different turn cannot confirm a steer');
+    assert.equal(f.sent.at(-1).requestEventId, changed.eventId);
+    assert.equal(f.requests.filter((item) => item.method === 'turn/start').length, 1,
+      'steering must not start another turn');
+  } finally { f.agent.stop(); }
+});
+
+test('steering before a Codex turn exists is declined without starting another turn', () => {
+  const f = fixture();
+  try {
+    assert.equal(f.agent.receive(f.start), true);
+    const steer = { type: 'task.steer', eventId: randomUUID(), machineId: f.sent[0].machineId,
+      sessionId: f.start.sessionId, taskId: f.start.taskId, runId: f.start.runId,
+      prompt: 'Focus on tests.' };
+    assert.equal(f.agent.receive(steer), true);
+    assert.equal(f.sent.at(-1).type, 'task.steer.result');
+    assert.equal(f.sent.at(-1).accepted, false);
+    assert.equal(f.requests.some((request) => request.method === 'turn/steer'), false);
   } finally { f.agent.stop(); }
 });
 
@@ -274,7 +376,7 @@ test('Codex cannot start a turn if the server falls back to a different permissi
       approvalPolicy: 'on-request', activePermissionProfile: { id: ':workspace' } } });
     await f.tick();
     assert.equal(f.sent.at(-1).type, 'task.failed');
-    assert.match(f.sent.at(-1).reason, /read-only permissions profile/);
+    assert.match(f.sent.at(-1).reason, /required permissions profile/);
     assert.equal(f.requests.some((request) => request.method === 'turn/start'), false);
   } finally { f.agent.stop(); }
 });
@@ -336,6 +438,7 @@ test('real command approval stays paused and accepts only the exact decision onc
     await f.tick();
     const approval = f.sent.at(-1);
     assert.equal(approval.type, 'approval.required');
+    assert.equal(approval.actionKind, 'local-demo-push');
     assert.equal(f.requests.some(request => request.id === 91), false, 'no response before the phone decision');
     const response = { ...approval, type: 'approval.response', approved: true };
     assert.equal(f.agent.receive({ ...response, actionDigest: '0'.repeat(64) }), false);
@@ -349,7 +452,74 @@ test('real command approval stays paused and accepts only the exact decision onc
     f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
     await f.tick();
     assert.equal(f.sent.at(-1).type, 'task.completed');
+    assert.equal(f.sent.at(-1).summary, 'Done. The prepared changes are published to the local demo branch.');
     assert.equal(f.agent.receive(f.start), false, 'a replayed task must not start another Codex process');
+  } finally { f.agent.stop(); }
+});
+
+test('a zero-exit demo push is not reported complete without the expected remote ref', async () => {
+  const command = 'git push origin HEAD:refs/heads/phone-demo';
+  const f = fixture(true, { approvalCommand: command,
+    verifyPushResult: () => { throw new DemoPushSafetyError('Destination ref missing'); } });
+  try {
+    await startTurn(f);
+    f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push', command, cwd: process.cwd(),
+    } });
+    await f.tick();
+    const approval = f.sent.at(-1);
+    assert.equal(approval.type, 'approval.required');
+    assert.equal(f.agent.receive({ ...approval, type: 'approval.response', approved: true }), true);
+    f.reply({ method: 'item/completed', params: { threadId: 'thread-test', turnId: 'turn-test',
+      item: { id: 'protected-push', type: 'commandExecution', status: 'completed', exitCode: 0 } } });
+    f.reply({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id: 'turn-test', status: 'completed' } } });
+    await f.tick();
+    assert.equal(f.sent.at(-1).type, 'task.failed');
+    assert.match(f.sent.at(-1).reason, /destination ref could not be verified/);
+    assert.equal(f.sent.some(event => event.type === 'task.completed'), false);
+  } finally { f.agent.stop(); }
+});
+
+test('demo push cannot be approved after HEAD or origin changes while the callback is pending', async () => {
+  for (const changed of [
+    { head: 'b'.repeat(40), pushUrl: 'fixture-origin', localTarget: null },
+    { head: 'a'.repeat(40), pushUrl: 'different-origin', localTarget: null },
+  ]) {
+    let reads = 0;
+    const f = fixture(true, { approvalCommand: 'git push origin HEAD:refs/heads/phone-demo',
+      inspectPushState: () => ++reads === 1
+        ? { head: 'a'.repeat(40), pushUrl: 'fixture-origin', localTarget: null } : changed });
+    try {
+      await startTurn(f);
+      f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+        threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push',
+        command: 'git push origin HEAD:refs/heads/phone-demo', cwd: process.cwd(),
+      } });
+      await f.tick();
+      const approval = f.sent.at(-1);
+      assert.equal(approval.type, 'approval.required');
+      assert.equal(f.agent.receive({ ...approval, type: 'approval.response', approved: true }), true);
+      assert.deepEqual(f.requests.filter(request => request.id === 91), [{ id: 91, result: { decision: 'cancel' } }]);
+      assert.equal(f.sent.at(-1).type, 'task.failed');
+      assert.match(f.sent.at(-1).reason, /changed while approval was pending/);
+    } finally { f.agent.stop(); }
+  }
+});
+
+test('dirty or unverifiable demo push state fails before a phone approval is offered', async () => {
+  const f = fixture(true, { approvalCommand: 'git push origin HEAD:refs/heads/phone-demo',
+    inspectPushState: () => { throw new DemoPushSafetyError('The demo push is blocked: the repository has uncommitted or untracked files.'); } });
+  try {
+    await startTurn(f);
+    f.reply({ id: 91, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 'thread-test', turnId: 'turn-test', itemId: 'protected-push',
+      command: 'git push origin HEAD:refs/heads/phone-demo', cwd: process.cwd(),
+    } });
+    await f.tick();
+    assert.equal(f.sent.some(event => event.type === 'approval.required'), false);
+    assert.deepEqual(f.requests.filter(request => request.id === 91), [{ id: 91, result: { decision: 'decline' } }]);
+    assert.equal(f.sent.at(-1).type, 'task.failed');
+    assert.match(f.sent.at(-1).reason, /uncommitted or untracked/);
   } finally { f.agent.stop(); }
 });
 
@@ -520,7 +690,8 @@ test('the spawned runtime does not inherit telephony keys or the voice API key',
   try {
     f.agent.receive(f.start);
     assert.deepEqual(f.launches[0][2].env, { PATH: 'runtime-path', USERPROFILE: 'local-user' });
-    assert.deepEqual(f.launches[0][1], ['-c', 'features.apps=false', '-c', 'features.plugins=false', 'app-server']);
+    assert.deepEqual(f.launches[0][1], ['-c', 'features.apps=false', '-c', 'features.plugins=false',
+      '-c', 'features.multi_agent=false', '-c', 'web_search=disabled', 'app-server']);
   } finally { f.agent.stop(); }
 });
 

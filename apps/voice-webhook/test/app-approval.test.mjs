@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { test } from 'node:test';
-import { win32 } from 'node:path';
+import { join, relative, resolve, win32 } from 'node:path';
 import WebSocket from 'ws';
 import { createDaemonClient } from '../../daemon/src/client.mjs';
 import { createFakeAgent, FAKE_AGENT_ID } from '../../daemon/src/fake-agent.mjs';
 import { createCodexAgent, CODEX_AGENT_ID } from '../../daemon/src/codex-agent.mjs';
+import { prepareApprovalRehearsal } from '../../daemon/src/approval-rehearsal.mjs';
 import { stubCodexProcess } from './helpers/codex-process.mjs';
 import { createServer } from '../src/app.mjs';
 import { hashPin } from '../src/pin.mjs';
@@ -20,8 +23,10 @@ async function waitFor(predicate, timeoutMs = 3000) {
   }
 }
 
-async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 'Push the demo branch.') {
+async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 'Push the demo branch.', decisionMode = 'callback', additionalPermissions = null) {
   const isCodex = mode === 'codex';
+  const fixture = isCodex ? prepareApprovalRehearsal(join(tmpdir(), 'dylamo-approval-rehearsals')) : null;
+  const codexWorkspace = fixture?.workspace ?? process.cwd();
   const command = 'git push origin HEAD:refs/heads/phone-demo';
   const runtimeCommand = process.platform === 'win32' && process.env.SystemRoot
     ? `"${win32.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe').replaceAll('\\', '\\\\')}" -Command '${command}'`
@@ -41,6 +46,7 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
   let time = Date.now();
   const store = openStateStore(':memory:', { now: () => time });
   const callbackRequests = [];
+  const spoken = [];
   let bridge;
   const server = createServer({
     authToken, accountSid, publicBaseUrl, allowedCallerNumber: caller,
@@ -56,7 +62,7 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     },
     realtimeConnector: (options) => {
       bridge = options;
-      return { appendAudio() {}, acknowledgeMark() {}, close() {}, speak: () => true };
+      return { appendAudio() {}, acknowledgeMark() {}, close() {}, speak: text => { spoken.push(text); return true; } };
     },
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -69,8 +75,15 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     onEvent: (event) => fake.receive(event),
     onStatus: (state) => { if (state === 'online') fake.flush(); },
   });
-  fake = isCodex ? createCodexAgent({ machineId, send: event => client.send(event), workspace: process.cwd(), allowFullRead: true,
-    approvalCommand: command, now: () => time, spawnProcess: () => stubCodexProcess({ command: runtimeCommand, cwd: process.cwd(), decisions, requests: runtimeRequests }),
+  fake = isCodex ? createCodexAgent({ machineId, send: event => client.send(event), workspace: codexWorkspace, allowFullRead: true,
+    approvalCommand: command, now: () => time, processEnv: fixture.env,
+    spawnProcess: () => stubCodexProcess({ command: runtimeCommand, cwd: codexWorkspace, decisions, requests: runtimeRequests, additionalPermissions,
+      onAccept: () => {
+        assert.equal(fixture.remoteCommit(), '', 'the destination must be empty until the authenticated decision');
+        assert.equal(fixture.unchanged(), true, 'only the prepared disposable source may be pushed');
+        fixture.git(fixture.workspace, ['push', 'origin', 'HEAD:refs/heads/phone-demo']);
+      },
+    }),
     logger: { error() {} },
   }) : createFakeAgent({ machineId, send: (event) => client.send(event), delayMs: 60 });
   let media;
@@ -87,7 +100,8 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     await waitFor(() => store.getMachine(machineId)?.status === 'online');
     const inbound = { AccountSid: accountSid, From: caller, To: twilioNumber, CallSid: inboundSid };
     await post('/voice', inbound);
-    const pin = await post('/voice/pin', { ...inbound, Digits: '1234' });
+    const pin = await post('/voice/pin', { ...inbound,
+      ...(decisionMode === 'callback' ? { Digits: '1234' } : { SpeechResult: 'one two three four' }) });
     const token = (await pin.text()).match(/name="token" value="([0-9a-f]+)"/)?.[1];
     assert.ok(token);
     media = new WebSocket(origin.replace('http:', 'ws:') + '/media', {
@@ -97,18 +111,97 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     media.send(JSON.stringify({ event: 'start', streamSid,
       start: { streamSid, accountSid, callSid: inboundSid, customParameters: { token } } }));
     await waitFor(() => bridge && store.getCall(inboundSid).state === 'streaming');
+    bridge.onSpeechStart('before-action');
+    bridge.onSpeechStop();
     bridge.onTranscript(transcript);
     if (isCodex) {
-      assert.equal(store.listTasksForSession(store.getCall(inboundSid).session_id).length, 0);
+      assert.equal(store.listTasksForSession(store.getCall(inboundSid).session_id).length, 1,
+        'the spoken request starts a task without a read-back or confirmation');
       assert.deepEqual(decisions, []);
-      assert.equal(callbackRequests.length, 0, 'read-back is not an action approval');
-      bridge.onTranscript('Yes, start it.');
+      assert.equal(callbackRequests.length, 0, 'starting a task is not action approval');
       if (transcript === 'Run the demo push.') {
         await waitFor(() => store.listTasksForSession(store.getCall(inboundSid).session_id)[0]?.state === 'waiting_human');
+        bridge.onTranscript('Approve.', 'before-action');
+        bridge.onTranscript('Approve.', 'missing-start');
         bridge.onTranscript('Yes, start it.');
-        assert.deepEqual(decisions, [], 'spoken confirmation cannot approve the protected action');
+        for (const digit of ['0', '9']) media.send(JSON.stringify({ event: 'dtmf', streamSid,
+          dtmf: { track: 'inbound_track', digit } }));
+        await new Promise(resolve => { media.once('pong', resolve); media.ping(); });
+        assert.deepEqual(decisions, [], 'generic yes, pre-action speech and uncorrelated transcripts cannot approve');
+        assert.equal(store.listTasksForSession(store.getCall(inboundSid).session_id)[0].state, 'waiting_human',
+          'unrecognized inbound keys cannot decide the protected action');
+        assert.equal(fixture.remoteCommit(), '', 'authentication alone cannot push');
         assert.equal(callbackRequests.length, 0, 'callback waits for hangup');
       }
+    }
+    if (decisionMode !== 'callback') {
+      const sessionId = store.getCall(inboundSid).session_id;
+      const task = store.listTasksForSession(sessionId)[0];
+      await waitFor(() => store.getTask(task.id).state === 'waiting_human');
+      const approvalId = store.getPendingApprovalForSession(sessionId).id;
+      assert.ok(spoken.some(text => text.includes('prepared changes to the local demo branch')));
+      assert.ok(spoken.some(text => text.includes('Say approve or reject')));
+      assert.equal(spoken.some(text => text.includes(runtimeCommand) || text.includes(codexWorkspace)), false,
+        'the default approval prompt omits technical details');
+      const context = store.getApprovalContext(approvalId);
+      assert.equal(context.action_kind, 'local-demo-push');
+      assert.equal(context.command, runtimeCommand, 'the full runtime command is still persisted');
+      const digest = context.action_digest;
+      bridge.onTranscript('Details.');
+      assert.ok(spoken.at(-1).includes(runtimeCommand) && spoken.at(-1).includes(codexWorkspace));
+      bridge.onTranscript('Repeat.');
+      assert.match(spoken.at(-1), /prepared changes to the local demo branch/);
+      assert.equal(store.getApprovalContext(approvalId).action_digest, digest);
+      assert.deepEqual(decisions, [], 'details and repeat do not decide anything');
+      assert.equal(store.listAudit(sessionId).filter(e => e.type === 'call.authenticated').length, 1);
+      bridge.onSpeechStart('qualified');
+      bridge.onSpeechStop();
+      bridge.onTranscript('Approve, but only if the tests pass.', 'qualified');
+      assert.deepEqual(decisions, [], 'qualified consent must not approve');
+      bridge.onSpeechStart('failed-transcription');
+      bridge.onTranscriptionFailure();
+      bridge.onSpeechStop();
+      bridge.onTranscript('Approve.', 'failed-transcription');
+      assert.deepEqual(decisions, [], 'transcription failure invalidates consent');
+      media.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { track: 'outbound_track', digit: '1' } }));
+      media.send(JSON.stringify({ event: 'dtmf', streamSid, dtmf: { track: 'inbound_track', digit: '3' } }));
+      await new Promise(resolve => { media.once('pong', resolve); media.ping(); });
+      assert.ok(spoken.at(-1).includes(runtimeCommand) && spoken.at(-1).includes(codexWorkspace));
+      assert.equal(store.getApproval(approvalId).state, 'pending', 'repeat and invalid track are not decisions');
+      if (failurePath === 'expired-inline') time += 300_001;
+      if (decisionMode === 'speech') {
+        bridge.onSpeechStart('decision');
+        bridge.onSpeechStop();
+        bridge.onTranscript(choice === '1' ? 'Approve.' : 'Reject.', 'decision');
+        bridge.onTranscript(choice === '1' ? 'Approve.' : 'Reject.', 'decision');
+      } else {
+        for (let i = 0; i < 2; i++) media.send(JSON.stringify({ event: 'dtmf', streamSid,
+          dtmf: { track: 'inbound_track', digit: choice } }));
+        await new Promise(resolve => { media.once('pong', resolve); media.ping(); });
+      }
+      if (failurePath === 'expired-inline') {
+        assert.deepEqual(decisions, []);
+        assert.equal(fixture.remoteCommit(), '');
+        assert.notEqual(store.getApproval(approvalId).state, 'approved');
+      } else {
+        await waitFor(() => store.getTask(task.id).state === (choice === '1' ? 'completed' : 'failed'));
+        assert.deepEqual(decisions, [choice === '1' ? 'accept' : 'cancel']);
+        assert.equal(fixture.remoteCommit(), choice === '1' ? fixture.expectedCommit : '');
+        assert.equal(store.getApprovalCallback(approvalId), undefined);
+        assert.equal(spoken.includes('The exact action was approved once. Codex is resuming.'), false,
+          'do not narrate a second approval acknowledgment');
+        const audit = store.listAudit(sessionId).filter(e => e.type === 'approval.decided');
+        assert.equal(audit.length, 1);
+        assert.equal(JSON.parse(audit[0].payload).channel, 'inbound');
+        assert.equal(store.listTasksForSession(sessionId).length, 1, 'duplicate consent is not another task');
+        assert.doesNotMatch(JSON.stringify(store.listAudit(sessionId)), /one two three four|1234/);
+      }
+      assert.equal(callbackRequests.length, 0, 'remaining on the call requires no callback');
+      media.close();
+      await new Promise(resolve => media.once('close', resolve));
+      await waitFor(() => store.getCall(inboundSid).state === 'ended');
+      assert.equal(callbackRequests.length, 0, 'resolved or expired decisions never trigger a callback on hangup');
+      return;
     }
     media.close();
     await new Promise((resolve) => media.once('close', resolve));
@@ -135,6 +228,7 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
       assert.equal(approval.codex_item_id, 'push-item');
       assert.equal(approval.codex_request_id, '"approval-rpc"');
       assert.deepEqual(decisions, [], 'underlying request remains paused after hangup');
+      assert.equal(fixture.remoteCommit(), '', 'the local destination stays empty after hangup');
     }
     const outbound = { AccountSid: accountSid, From: twilioNumber, To: caller,
       CallSid: callbackSid, Direction: 'outbound-api' };
@@ -175,6 +269,7 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
       assert.equal(store.getApproval(approvalId).state, 'pending');
       assert.equal(store.getTask(task.id).state, 'waiting_human');
       assert.equal(callbackRequests.length, 1, 'never retry an uncertain outbound call automatically');
+      if (isCodex) assert.equal(fixture.remoteCommit(), '', 'an unavailable callback cannot push');
       return;
     }
     assert.match(await (await post(decisionPath, { ...outbound, Digits: choice })).text(), /<Hangup\/>/);
@@ -182,12 +277,26 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     const wrongSid = { ...outbound, CallSid: `CA${'d'.repeat(32)}` };
     assert.match(await (await post(callbackPath, wrongSid)).text(), /<Hangup\/>/);
     const beforePin = await (await post(callbackPath, outbound)).text();
-    assert.match(beforePin, /Enter your four digit PIN/);
+    assert.match(beforePin, /Say your four PIN digits/);
     assert.equal(beforePin.includes('git push'), false, 'action details must not be disclosed before PIN verification');
-    assert.match(await (await post(pinPath, { ...outbound, Digits: '9999' })).text(), /Enter your four digit PIN/);
+    assert.doesNotMatch(beforePin, /prepared changes|demo branch|GitHub/);
+    assert.match(await (await post(pinPath, { ...outbound, Digits: '9999' })).text(), /Say your four PIN digits/);
     assert.equal(store.getApprovalCallback(approvalId).pin_verified, 0);
-    assert.match(await (await post(pinPath, { ...outbound, Digits: '1234' })).text(), /Press 1 to approve/);
+    const brief = await (await post(pinPath, { ...outbound, SpeechResult: 'one two three four' })).text();
+    assert.match(brief, /Press 1 to approve/);
+    assert.equal(brief.includes(runtimeCommand) || brief.includes(codexWorkspace), additionalPermissions != null);
+    assert.match(brief, additionalPermissions ? /Extra permissions/ : isCodex ? /prepared changes to the local demo branch/ : /practice push/);
+    if (additionalPermissions) assert.doesNotMatch(brief, /Nothing goes to GitHub|prepared changes/);
     assert.equal(store.getApprovalCallback(approvalId).pin_verified, 1);
+    const details = await (await post(decisionPath, { ...outbound, Digits: '3' })).text();
+    // XML escapes the Windows wrapper quotes while retaining the exact command body.
+    assert.match(details, /git push/);
+    assert.ok(details.includes(isCodex ? codexWorkspace : 'demo-repository'));
+    assert.equal(store.getApproval(approvalId).state, 'pending');
+    assert.deepEqual(decisions, [], 'details never authorize a command');
+    const repeat = await (await post(decisionPath, { ...outbound, Digits: '' })).text();
+    assert.match(repeat, additionalPermissions ? /Extra permissions/ : isCodex ? /prepared changes to the local demo branch/ : /practice push/);
+    assert.equal(repeat.includes('git push'), additionalPermissions != null, 'no input returns to the default prompt');
     const result = await (await post(decisionPath, { ...outbound, Digits: choice })).text();
     assert.match(result, choice === '1' ? /Approved/ : /Rejected/);
     assert.equal(store.getApproval(approvalId).state, choice === '1' ? 'approved' : 'rejected');
@@ -196,10 +305,12 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     assert.equal(callbackRequests.length, 1);
     if (isCodex) {
       assert.deepEqual(decisions, [choice === '1' ? 'accept' : 'cancel']);
+      assert.equal(fixture.remoteCommit(), choice === '1' ? fixture.expectedCommit : '',
+        'only an authenticated approval moves the local destination ref');
       if (choice === '1') {
         const resultPath = `/approval/result?approvalId=${approvalId}&nonce=${nonce}`;
-        assert.match(await (await post(resultPath, outbound)).text(), /fixture push completed/);
-        assert.equal(store.getTask(task.id).result_text, 'The fixture push completed.');
+        assert.match(await (await post(resultPath, outbound)).text(), /published to the local demo branch/);
+        assert.equal(store.getTask(task.id).result_text, 'Done. The prepared changes are published to the local demo branch.');
       }
     }
     await post(statusPath, { ...outbound, CallStatus: 'completed' });
@@ -212,6 +323,15 @@ async function runApprovalFlow(choice, mode = 'fake', failurePath, transcript = 
     client.stop();
     await new Promise((resolve) => server.close(resolve));
     store.close();
+    if (fixture) {
+      const parent = resolve(join(tmpdir(), 'dylamo-approval-rehearsals'));
+      const target = resolve(fixture.directory);
+      const suffix = relative(parent, target);
+      if (!suffix.startsWith('approval-rehearsal-') || suffix.includes('..') || suffix.includes('/') || suffix.includes('\\')) {
+        throw new Error('Unexpected cleanup target');
+      }
+      rmSync(target, { recursive: true, force: true });
+    }
   }
 }
 
@@ -225,6 +345,16 @@ test('demo push shortcut survives hangup and accepts only after PIN and DTMF', (
 test('demo push shortcut survives hangup and cancels after PIN and DTMF rejection', () =>
   runApprovalFlow('2', 'codex', undefined, 'Run the demo push.'));
 
+test('extra permission requests retain the full disclosure rather than a brief demo summary', () =>
+  runApprovalFlow('1', 'codex', undefined, 'Run the demo push.', 'callback', { network: { enabled: true } }));
+
 for (const failure of ['no-answer', 'busy', 'failed', 'canceled', 'voicemail', 'expired', 'callback-error']) {
   test(`callback ${failure} keeps the real request blocked without a repeated call`, () => runApprovalFlow('1', 'codex', failure));
+}
+
+for (const decisionMode of ['speech', 'keypad']) {
+  for (const choice of ['1', '2']) test(`same-call ${decisionMode} ${choice === '1' ? 'approval' : 'rejection'} needs one PIN and no callback`, () =>
+    runApprovalFlow(choice, 'codex', undefined, 'Run the demo push.', decisionMode));
+  test(`expired same-call action cannot be approved by ${decisionMode}`, () =>
+    runApprovalFlow('1', 'codex', 'expired-inline', 'Run the demo push.', decisionMode));
 }

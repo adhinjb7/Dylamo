@@ -52,6 +52,26 @@ test('permission changes and different runtime identities require a different di
     assert.notEqual(first.actionDigest, next.actionDigest);
   }
   assert.notEqual(first.actionDigest, f.policy.prepare(f.run, { ...f.request, id: '7' }).actionDigest);
+  assert.notEqual(first.actionDigest, f.policy.prepare(f.run, f.request, {
+    head: 'a'.repeat(40), pushUrl: 'local-origin', localTarget: null,
+  }).actionDigest, 'the held Git state is bound into the one-use decision');
+});
+
+test('local push description requires checked state and does not conceal extra grants', () => {
+  const f = fixture();
+  const plain = f.policy.prepare(f.run, f.request);
+  assert.equal(plain.actionKind, undefined);
+  const checked = f.policy.prepare(f.run, f.request, { head: 'a'.repeat(40), localTarget: 'verified-fixture' });
+  assert.equal(checked.actionKind, 'local-demo-push');
+  assert.notEqual(checked.actionDigest, plain.actionDigest);
+  const extra = f.policy.prepare(f.run, { ...f.request, params: { ...f.request.params,
+    additionalPermissions: { network: true } } }, { head: 'a'.repeat(40) });
+  assert.equal(extra.actionKind, undefined);
+  assert.notEqual(extra.actionDigest, checked.actionDigest);
+  const command = 'git push origin main';
+  const other = createCodexApproval({ machineId: randomUUID(), workspace: process.cwd(), command });
+  assert.equal(other.prepare(f.run, { ...f.request, params: { ...f.request.params, command } },
+    { head: 'a'.repeat(40) }).actionKind, undefined);
 });
 
 test('local file-URL cwd matches only the configured absolute workspace', () => {

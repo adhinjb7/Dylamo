@@ -122,6 +122,23 @@ test('duplicate transcript events cannot replay a task or its confirmation', () 
   } finally { bridge.close(); }
 });
 
+test('speech-start item IDs allow delayed transcripts to be bound to the correct utterance', () => {
+  const twilio = new FakeSocket();
+  const upstream = new FakeSocket();
+  const starts = [];
+  const transcripts = [];
+  const bridge = connectRealtime({ twilio, streamSid: 'MZbinding', apiKey: 'test-key', controlled: true,
+    onSpeechStart: id => starts.push(id), onTranscript: (text, id) => transcripts.push({ text, id }),
+    createSocket: () => upstream });
+  try {
+    for (const item_id of ['old-turn', 'new-turn']) upstream.receive({ type: 'input_audio_buffer.speech_started', item_id });
+    upstream.receive({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'new-turn', transcript: 'Repeat.' });
+    upstream.receive({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'old-turn', transcript: 'Approve.' });
+    assert.deepEqual(starts, ['old-turn', 'new-turn']);
+    assert.deepEqual(transcripts, [{ text: 'Repeat.', id: 'new-turn' }, { text: 'Approve.', id: 'old-turn' }]);
+  } finally { bridge.close(); }
+});
+
 function controlledFixture() {
   const twilio = new FakeSocket();
   const upstream = new FakeSocket();

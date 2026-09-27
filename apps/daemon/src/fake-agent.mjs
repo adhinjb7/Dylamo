@@ -12,7 +12,7 @@ export function createFakeAgent({ machineId, send, delayMs = COMPLETION_DELAY_MS
   const pending = [];
 
   function emit(run, type, fields) {
-    if (type === 'task.completed' || type === 'task.failed') run.finished = true;
+    if (type === 'task.completed' || type === 'task.failed' || type === 'task.cancelled') run.finished = true;
     pending.push({
       v: PROTOCOL_VERSION, eventId: randomUUID(), machineId,
       sessionId: run.sessionId, taskId: run.taskId, runId: run.runId,
@@ -26,6 +26,15 @@ export function createFakeAgent({ machineId, send, delayMs = COMPLETION_DELAY_MS
   }
 
   function receive(event) {
+    if (event.type === 'task.cancel') {
+      const run = runs.get(event.runId);
+      if (!run || run.finished || event.machineId !== machineId || run.sessionId !== event.sessionId || run.taskId !== event.taskId) return false;
+      if (run.timer) clearTimer(run.timer);
+      run.timer = null;
+      if (run.approval) run.approval.resolved = true;
+      emit(run, 'task.cancelled', { reason: 'The simulated task was cancelled by the caller.' });
+      return true;
+    }
     if (event.type === 'approval.response') {
       const run = runs.get(event.runId);
       const pending = run?.approval;

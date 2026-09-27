@@ -1,6 +1,21 @@
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 const PIN_PATTERN = /^\d{4}$/;
+const SPOKEN_DIGITS = { zero: '0', oh: '0', one: '1', two: '2', three: '3', four: '4',
+  five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+
+// Parse only digit-by-digit speech, never infer a PIN from surrounding prose.
+// This runs before the agent/media session and must never log or echo input.
+export function pinFromInput({ Digits, SpeechResult } = {}) {
+  const digitsPresent = typeof Digits === 'string' && Digits.length > 0;
+  const speechPresent = typeof SpeechResult === 'string' && SpeechResult.trim().length > 0;
+  if (digitsPresent) return !speechPresent && PIN_PATTERN.test(Digits) ? Digits : '';
+  if (!speechPresent || SpeechResult.length > 80) return '';
+  const words = SpeechResult.trim().toLowerCase().replace(/[.!?]+$/, '').split(/[\s,\-]+/);
+  const digits = words.map(word => /^\d{1,4}$/.test(word) ? word : (SPOKEN_DIGITS[word] ?? '')).join('');
+  if (words.some(word => !/^\d{1,4}$/.test(word) && !Object.hasOwn(SPOKEN_DIGITS, word))) return '';
+  return PIN_PATTERN.test(digits) ? digits : '';
+}
 
 export function hashPin(pin, salt = randomBytes(16)) {
   if (!PIN_PATTERN.test(pin)) throw new Error('PIN must contain exactly four digits');

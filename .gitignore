@@ -7,4 +7,5 @@ coverage/
 dist/
 data/
 work/
+.dylamo-tmp/
 Hack_Atlantic_Agent_Telephony_Codex_Brief_Revised.docx
