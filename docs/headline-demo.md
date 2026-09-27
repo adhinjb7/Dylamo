@@ -1,129 +1,92 @@
 # Protected local-release demo
 
-This is the primary Dylamo demo. It proves that a task can continue after a
-caller hangs up, a real callback can return the human to the loop, and one
-exact protected action needs a one-use phone approval.
+This primary demo shows a task continuing after the caller hangs up, a callback returning the caller to the loop, and a one-use approval for one exact action. It pushes a prepared commit only to a fresh disposable local bare repository; it never changes Dylamo, GitHub, or a public site.
 
-It is intentionally a **prepared-change** demo. Codex requests a local push of
-a prepared commit to a fresh disposable bare repository. It does not edit the
-Dylamo project, push to GitHub, or deploy a public website.
+## Audience flow
 
-## What the audience sees
+1. The local preview starts navy and says **Dylamo demo site**.
+2. The caller says **Run the demo push**, receives task-start confirmation, and hangs up.
+3. Dylamo calls back, reauthenticates the caller, and requests approval to publish prepared changes to the local demo branch.
+4. After one approval, the preview turns green and says **Hello, Hack Atlantic!**
 
-1. A local preview starts navy and says **Dylamo demo site**.
-2. The caller asks Dylamo to “Run the demo push” (or “Push the demo repo”), then hangs up.
-3. Dylamo calls back, authenticates the caller again, and briefly explains the
-   effect: publish prepared changes to the **local demo branch** only.
-4. The caller approves once. The preview turns green and says **Hello, Hack
-   Atlantic!**
+## Prepare the fixture
 
-## First rehearsal: prepare safely
+From the repository root:
 
-Run these commands in a normal PowerShell terminal from the repository root:
-
-```powershell
+~~~sh
 npm run build:protocol
 node apps/daemon/scripts/headline-demo.mjs --serve
-```
+~~~
 
-Keep the preview terminal open and visit `http://127.0.0.1:4173/`. It should
-show the navy baseline. The script prints a fresh disposable `CODEX_WORKSPACE`
-and `GIT_CONFIG_GLOBAL` path. Put only those two printed paths in the private
-`apps/daemon/.env`. The daemon pins the other isolation settings itself.
+Keep the preview open at http://127.0.0.1:4173/ and confirm the navy baseline. Copy only the printed CODEX_WORKSPACE and GIT_CONFIG_GLOBAL paths into the private **apps/daemon/.env**; the daemon sets the remaining isolation values.
 
-For the named demo action, the daemon `.env` must also keep these values:
+Keep these daemon settings:
 
-```ini
+~~~ini
 CODEX_APPROVAL_COMMAND=git push origin HEAD:refs/heads/phone-demo
 CODEX_ALLOW_WORKSPACE_WRITE=false
-```
+~~~
 
-Do **not** point the Dylamo GitHub remote at this fixture. The fixture's
-`origin` is a sibling local bare repository created in a temporary folder.
+The fixture origin is a sibling local bare repository in a temporary folder. Do not point the Dylamo GitHub remote at it.
 
-The private voice `.env` needs the already-working live configuration:
-`VOICE_MODE=realtime`, `AGENT_MODE=codex`, `CODEX_APPROVAL_ENABLED=true`, a
-Twilio number, your allowlisted caller number, and a configured PIN. Keep ngrok
-running. Restart the daemon and voice webhook after changing either `.env` or
-after rebuilding the protocol.
+On this Mac, set CODEX_ALLOW_FULL_READ=true only with the machine owner’s consent. It enables the required workspace reads while writes and network access remain restricted.
 
-Before any call, run:
+The private voice .env needs the working live configuration: VOICE_MODE=realtime, AGENT_MODE=codex, CODEX_APPROVAL_ENABLED=true, OPENAI_API_KEY, DAEMON_CREDENTIALS, a Twilio number, an allowlisted caller, and a PIN. Keep a public HTTPS tunnel to port 3000 running. Restart the daemon and webhook after changing either .env file or rebuilding the protocol.
 
-```powershell
+Before calling, run:
+
+~~~sh
 node --env-file=apps/daemon/.env apps/daemon/scripts/check-demo-push.mjs
 node --env-file=apps/voice-webhook/.env --env-file=apps/daemon/.env apps/daemon/scripts/observe-phone-approval.mjs --check
-```
+~~~
 
-Both must print `PASS`. These checks do not start a model turn, place a phone
-call, or push anything.
+Both must print PASS; neither starts Codex, calls a phone, nor pushes.
 
-## Low-risk Codex rehearsal
+## Rehearse rejection
 
-Before a live phone test, run this exact reject rehearsal:
+Before a live call, run:
 
-```powershell
+~~~sh
 node --env-file=apps/daemon/.env apps/daemon/scripts/rehearse-approval.mjs --run --decision=reject
-```
+~~~
 
-It uses one short Codex turn but never calls a phone, touches GitHub, or pushes
-the local branch. It verifies that the exact command is held and remains blocked
-after rejection. It can take up to two minutes.
+It uses one short Codex turn and confirms the exact command remains blocked after rejection. It never calls a phone, accesses GitHub, or pushes. Allow up to two minutes.
 
-## Full callback trial
+## Run the callback trial
 
-Start and leave open these four things:
+Keep the preview, webhook, daemon, public HTTPS tunnel, and watcher running:
 
-1. The preview created with `headline-demo.mjs --serve`.
-2. The voice webhook:
+1. Preview: headline-demo.mjs --serve.
+2. Webhook:
 
-   ```powershell
+   ~~~sh
    node --env-file=apps/voice-webhook/.env apps/voice-webhook/src/server.mjs
-   ```
+   ~~~
 
-3. The paired daemon:
+3. Daemon:
 
-   ```powershell
+   ~~~sh
    node --env-file=apps/daemon/.env apps/daemon/src/server.mjs
-   ```
+   ~~~
 
-4. ngrok forwarding port 3000, plus this watcher in another terminal:
+4. Watcher:
 
-   ```powershell
+   ~~~sh
    node --env-file=apps/voice-webhook/.env --env-file=apps/daemon/.env apps/daemon/scripts/observe-phone-approval.mjs --watch
-   ```
+   ~~~
 
-Then call from the allowlisted phone, enter or say the PIN, and say exactly:
-**“Run the demo push.”** **“Push the demo repo”** is an equivalent supported
-phrase. Wait until Dylamo confirms the task started, then hang up. Answer the
-callback, authenticate again, and say **“approve”** or **“push the demo repo”**
-to approve once. Say **“reject”** to decline or **“details”** to hear the exact
-command. Keypad **1**, **2**, and **3** remain optional fallbacks.
+Call from the allowlisted phone, authenticate, and say **Run the demo push**. After task-start confirmation, hang up. On callback, authenticate and say **approve** or **push the demo repo**. Say **reject** to decline or **details** to hear the command; keys 1–3 are fallbacks.
 
-Treat the demo as successful only when the watcher reports a final `PASS` and
-the preview turns green. If the watcher has not first shown the held action,
-do not approve.
+Success requires a final watcher PASS and a green preview. Do not approve unless the watcher showed the held action.
 
-## Reset for another trial
+## Reset
 
-A successful fixture cannot be reused because its `phone-demo` branch is no
-longer empty. Press Ctrl+C only in the old preview terminal, run
-`headline-demo.mjs --serve` again, replace the two printed daemon fixture paths,
-restart the daemon, and repeat the two preflight checks. Leave old temporary
-fixtures alone for inspection; never reset or clean the Dylamo repository.
+A successful fixture cannot be reused because its phone-demo branch is no longer empty. Stop only the old preview, run headline-demo.mjs --serve again, replace the two printed fixture paths, restart the daemon, and repeat the preflight checks. Leave old temporary fixtures for inspection; never reset or clean the Dylamo repository.
 
-## Optional same-call variation
+## Same-call option
 
-Stay on the original authenticated call instead of hanging up. Once the held
-action is announced, say **“approve”** or press **1**. This skips the callback;
-the one-use decision is still tied to that exact action. The callback-first flow
-is the stronger presentation because it visibly demonstrates work continuing
-without the caller.
+Stay on the original authenticated call and approve when the held action is announced. The decision remains tied to that exact action. Use the callback flow in the presentation to show work continuing after hang-up.
 
-## Timing and honest limits
+## Timing and limits
 
-Allow 3–5 minutes for local setup, up to 2 minutes for the reject rehearsal,
-and 5–10 minutes for a first live callback trial. Carrier, tunnel, and Codex
-latency mean it is not guaranteed to complete inside one minute. For judges,
-start the task shortly before presenting and keep a clearly labeled fallback
-ready. The live contribution is protected continuation and approval—not an
-autonomous code change or a GitHub deployment.
+Allow 3–5 minutes for setup, up to 2 minutes for rehearsal, and 5–10 minutes for a first callback trial. Carrier, tunnel, and Codex latency can exceed one minute, so start early and label a fallback. The demo proves protected continuation and approval, not autonomous edits or a GitHub deployment.
