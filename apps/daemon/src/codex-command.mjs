@@ -49,12 +49,18 @@ export function matchesCodexCommand(actual, expected, {
 } = {}) {
   if (typeof actual !== 'string' || typeof expected !== 'string' || !expected) return false;
   if (actual === expected) return true;
-  if (platform !== 'win32') return false;
   // Wrapper compatibility is deliberately restricted to literal word commands.
   // Quotes, substitutions, redirection, separators, newlines and other shell
   // syntax are not normalized. An operator's more complex command must match
   // the complete raw runtime string exactly instead.
   if (!/^[A-Za-z0-9_.:/-]+(?: [A-Za-z0-9_.:/-]+)*$/.test(expected)) return false;
+  // Codex on macOS presents the literal command through zsh. Accept only the
+  // observed login-shell form and only the known system shell; no additional
+  // flags, arguments, substitutions, or shell syntax are normalized.
+  if (platform === 'darwin') {
+    return [`zsh -lc '${expected}'`, `/bin/zsh -lc '${expected}'`].includes(actual);
+  }
+  if (platform !== 'win32') return false;
   if (typeof windowsRoot !== 'string' || !/^[A-Za-z]:[\\/][A-Za-z0-9_ .\\/-]+$/.test(windowsRoot)) return false;
   const executable = win32.join(windowsRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const shells = [`'${executable}'`, `"${executable}"`];

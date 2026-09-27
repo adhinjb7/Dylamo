@@ -41,6 +41,19 @@ test('exact commands and only complete known Windows PowerShell wrappers match',
   assert.equal(matchesCodexCommand(wrapped, command, { ...windows, windowsRoot: 'relative' }), false);
 });
 
+test('only the observed macOS zsh wrapper matches a literal command', () => {
+  const macos = { platform: 'darwin' };
+  for (const shell of ['zsh', '/bin/zsh']) {
+    assert.equal(matchesCodexCommand(`${shell} -lc '${command}'`, command, macos), true);
+  }
+  for (const actual of [
+    `zsh -c '${command}'`, `zsh -lc \"${command}\"`, `bash -lc '${command}'`,
+    `/bin/zsh -lc '${command}; whoami'`, `/bin/zsh -lc '${command}' ; whoami`,
+    `/bin/zsh -lc '${command.replace('phone-demo', 'main')}'`,
+    `/bin/zsh -lc '${command} $(whoami)'`, `/bin/zsh -lc '${command}'\n`,
+  ]) assert.equal(matchesCodexCommand(actual, command, macos), false, actual);
+});
+
 test('observed double-quoted escaped Windows path matches without unescaping the command body', () => {
   // The operator's thread/read diagnostic reported exactly this shape:
   // "<escaped-system-powershell>" -Command '<configured-command>'
