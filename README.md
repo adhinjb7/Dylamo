@@ -1,51 +1,73 @@
 # Dylamo
 
-Dylamo is a self-hosted phone interface for local AI agents. An authenticated caller can start a task, hang up, and approve one exact action by phone when needed. The paired machine remains in control.
+Dylamo is a self-hosted phone interface for local AI agents. A signed Twilio voice webhook communicates with a paired local daemon over an authenticated WebSocket so an authenticated caller can start a task, hang up, receive a callback, and approve one exact protected action when needed.
 
-## MVP
+## What is included
 
-- Allowlisted caller authentication by spoken or keypad PIN.
-- A local Codex task that continues after the caller hangs up.
-- One-use approval for one configured local Git push to a disposable bare repository; never GitHub.
-- A synthetic local checkout monitor that places one phone alert. It runs no Codex task and sends no SMS.
+- Caller allowlisting and a four-digit PIN stored as a hash.
+- A loopback voice webhook with SQLite-backed call, task, and approval state.
+- An authenticated WebSocket connection to a paired local daemon.
+- A built-in fake agent and an opt-in Codex agent.
+- A protected local-release demo and a synthetic local checkout-monitor demo.
 
-## Local setup
+## Run locally
 
 Requires Node.js 22.13 or newer.
 
 ~~~sh
 npm install
 npm run build:protocol
-npm test
 ~~~
 
-Create ignored .env files from **apps/voice-webhook/.env.example** and **apps/daemon/.env.example**. Never commit phone numbers, PINs, keys, tokens, or tunnel URLs.
+Create ignored private .env files from **apps/voice-webhook/.env.example** and **apps/daemon/.env.example**. Never commit credentials, phone numbers, PINs, database files, or tunnel URLs.
 
-## Demos
+Generate the values needed to configure those files:
 
-1. [Protected local release](docs/headline-demo.md): a prepared visual change, callback, and one-use approval.
-2. [Synthetic monitor alert](docs/site-monitor-demo.md): a safe local outage simulation and phone notification.
+~~~sh
+node apps/voice-webhook/scripts/hash-pin.mjs
+node apps/daemon/scripts/generate-pairing.mjs
+~~~
 
-Run the protected-release preflight and rejection rehearsal before a live call.
+The PIN script prints a DEMO_PIN_HASH. The pairing script prints the matching daemon machine ID, token, and voice-webhook credential entry. Set PUBLIC_BASE_URL to a bare public HTTPS origin, set DAEMON_SERVER_URL to its matching WSS /daemon endpoint, and configure Twilio to POST to PUBLIC_BASE_URL plus /voice.
 
-## Layout
+Start both services in separate terminals after configuration:
 
-- **apps/voice-webhook/**: Twilio webhook, authentication, SQLite state, and callbacks.
-- **apps/daemon/**: paired local daemon, Codex adapter, approval boundary, and monitor.
-- **packages/protocol/**: validated webhook and daemon messages.
-- **docs/**: runbooks, architecture, handoffs, and poster provenance.
+~~~sh
+node --env-file=apps/voice-webhook/.env apps/voice-webhook/src/server.mjs
+node --env-file=apps/daemon/.env apps/daemon/src/server.mjs
+~~~
 
-## Boundaries
+Both bind to loopback by default. Run npm test for the full test suite when you want to verify a change.
 
-- Codex is read-only by default. Use writes only in a disposable, non-sensitive repository.
-- A PIN authenticates the caller; each approval applies to one pending action and expires.
-- The local monitor is a demo, not production monitoring or operational authority.
-- A successful call validates the demo; it does not deploy to GitHub or a public site.
+## Modes and demos
+
+The supplied .env.example defaults are VOICE_MODE=tone, AGENT_MODE=voice, and no Codex agent.
+
+The protected release demo requires realtime voice, AGENT_MODE=codex, daemon CODEX_AGENT_ENABLED=true, voice CODEX_APPROVAL_ENABLED=true, a paired daemon, an OpenAI key, and an outbound Twilio number. It also needs an installed, signed-in Codex CLI, a disposable CODEX_WORKSPACE, and the exact CODEX_APPROVAL_COMMAND. The runbook prepares the fixture. It approves only the prepared local fixture push; it never pushes Dylamo or GitHub.
+
+The synthetic monitor is opt-in. It emits fixed local outage and recovery events, places one notification call, checks no external site, and sends no SMS.
+
+- [Protected local-release demo](docs/headline-demo.md)
+- [Synthetic monitor demo](docs/site-monitor-demo.md)
+
+## Repository layout
+
+- **apps/voice-webhook/**: Twilio webhook, authentication, SQLite state, callbacks, and daemon gateway.
+- **apps/daemon/**: paired local daemon, fake and Codex adapters, approval boundary, and monitor.
+- **packages/protocol/**: validated messages shared by the webhook and daemon.
+- **docs/**: architecture, demo runbooks, and poster provenance.
+
+## Safety boundaries
+
+- The caller must match the allowlist and PIN; raw PINs are never stored.
+- Webhooks are signed, and daemon connections are authenticated.
+- Codex is read-only by default. Workspace writes require a disposable, non-sensitive repository.
+- Approvals are exact, one-use, and time-limited. A generic “yes” is insufficient.
+- The release fixture targets a disposable local bare repository. It never deploys to GitHub or a public site.
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Protected local-release runbook](docs/headline-demo.md)
-- [Synthetic monitor demo](docs/site-monitor-demo.md)
-- [Team handoffs](docs/team/README.md)
+- [Synthetic monitor runbook](docs/site-monitor-demo.md)
 - [Poster mockup provenance](docs/poster/daemon-dashboard-mockup-prompt.md)
